@@ -479,6 +479,86 @@ def test_payload_matches_official_openapi_contract() -> None:
                 )
 
 
+def test_state_messages_are_structured_not_bare_strings() -> None:
+    """每条历史消息都要带发送者/是否本人/是否叫 Bot/时间。
+
+    这是照抄 ``astrbot_plugin_reply_gate`` 的做法：只发可见转录，但每条
+    带足够字段。裸字符串会让模型无法区分"别人说的"和"Bot 自己说的"，
+    也没法判断新旧。
+    """
+    from betterchat_core import ChatLine
+
+    state = build_gate_state(
+        group_name="g",
+        latest="有人知道吗",
+        context=[
+            ChatLine(sender="小明", text="我改了配置", seconds_ago=42.0),
+            ChatLine(
+                sender="HexVergeBot", text="在的", is_self=True, seconds_ago=10.0
+            ),
+        ],
+        bot_messages=["在的"],
+        bot_name="HexVergeBot",
+        latest_sender="秉鑫",
+        bot_mentioned=False,
+        latest_seconds_ago=3.2,
+    )
+
+    messages = state["recent_messages"]
+    assert all(isinstance(m, dict) for m in messages)
+    assert messages[0]["sender"] == "小明"
+    assert messages[1]["is_self"] is True
+    assert messages[0]["seconds_ago"] == 42.0
+    # 最新消息也带发送者与时间。
+    assert state["latest_message"]["seconds_ago"] == 3.2
+    assert state["latest_message"]["sender"] == "秉鑫"
+
+
+def test_seconds_ago_omitted_when_unknown() -> None:
+    """没有时间戳就不输出这个键 —— 不编造 0 让模型误以为"刚刚发生"。"""
+    from betterchat_core import ChatLine
+
+    state = build_gate_state(
+        group_name="g",
+        latest="x",
+        context=[ChatLine(sender="a", text="y")],
+        bot_messages=[],
+        latest_seconds_ago=None,
+    )
+    assert "seconds_ago" not in state["latest_message"]
+    assert "seconds_ago" not in state["recent_messages"][0]
+
+
+def test_state_accepts_legacy_plain_strings() -> None:
+    """兼容旧调用：传纯字符串也能工作（包成 sender 为空的 ChatLine）。"""
+    state = build_gate_state(
+        group_name="g",
+        latest="x",
+        context=["纯字符串消息"],
+        bot_messages=[],
+    )
+    assert state["recent_messages"][0]["text"] == "纯字符串消息"
+    assert state["recent_messages"][0]["sender"] == ""
+
+
+def test_state_stays_json_serializable_with_structure() -> None:
+    import json
+
+    from betterchat_core import ChatLine
+
+    state = build_gate_state(
+        group_name="g",
+        latest="x",
+        context=[ChatLine(sender="a", text="y", seconds_ago=1.5)],
+        bot_messages=["z"],
+        bot_name="bot",
+        latest_sender="u",
+        bot_mentioned=True,
+        latest_seconds_ago=0.5,
+    )
+    assert json.loads(json.dumps(state)) == state
+
+
 def test_payload_is_json_serializable() -> None:
     """结构化 instructions/criteria 里不能混进不可序列化的对象。"""
     import json
@@ -550,7 +630,8 @@ def test_state_carries_bot_identity() -> None:
         bot_mentioned=True,
     )
     assert state["bot"] == {"name": "HexVergeBot", "mentioned_in_latest": True}
-    assert state["latest_sender"] == "someone"
+    assert state["latest_message"]["sender"] == "someone"
+    assert state["latest_message"]["text"] == "hi"
 
 
 def test_state_does_not_smuggle_instructions() -> None:
@@ -571,7 +652,6 @@ def test_state_does_not_smuggle_instructions() -> None:
     assert set(state) == {
         "group",
         "bot",
-        "latest_sender",
         "latest_message",
         "recent_messages",
         "recent_bot_messages",

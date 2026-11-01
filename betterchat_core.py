@@ -23,6 +23,7 @@ from typing import Callable, Iterable, Sequence
 
 __all__ = [
     "Action",
+    "ChatLine",
     "GateDecision",
     "GateReason",
     "GroupSettings",
@@ -614,15 +615,52 @@ def resolve_fail_policy(policy: str, *, already_woken: bool) -> Action:
     return Action.RESPOND if str(policy).lower() == "open" else Action.IGNORE
 
 
+@dataclass(frozen=True)
+class ChatLine:
+    """群里的一条消息（结构化）。
+
+    只存"可见的事实"：谁说的、说了什么、是不是 Bot 自己、是不是在叫 Bot、
+    多久以前。**不存**内部 ID、权限、原始对象 —— Jev 不需要，也不该看到。
+
+    为什么要有时间戳：``reply_gate`` 的做法值得学。判断"该不该接话"时，
+    "这条是 3 秒前还是 4 分钟前的"直接影响结论 —— 一个 5 分钟前没人接的
+    问题可以主动帮，但刚刚别人正在聊的话题就不该硬插。
+    """
+
+    sender: str
+    text: str
+    is_self: bool = False
+    at_bot: bool = False
+    seconds_ago: float | None = None
+
+
+def _chat_line_payload(line: ChatLine) -> dict[str, object]:
+    """把一条消息摊成 Jev 能直接读的对象。
+
+    ``seconds_ago`` 为 ``None`` 时**不输出这个键** —— 与其编一个 0 让模型
+    误以为"刚刚发生"，不如干脆不说。
+    """
+    payload: dict[str, object] = {
+        "sender": line.sender,
+        "text": line.text,
+        "is_self": bool(line.is_self),
+        "at_bot": bool(line.at_bot),
+    }
+    if line.seconds_ago is not None:
+        payload["seconds_ago"] = round(max(0.0, float(line.seconds_ago)), 1)
+    return payload
+
+
 def build_gate_state(
     *,
     group_name: str,
     latest: str,
-    context: Iterable[str],
+    context: "Sequence[ChatLine] | Sequence[str]",
     bot_messages: Iterable[str],
     bot_name: str = "",
     latest_sender: str = "",
     bot_mentioned: bool = False,
+    latest_seconds_ago: float | None = None,
     max_chars: int = 6000,
 ) -> dict[str, object]:
     """构造送进 Jev 的 ``state``。
@@ -633,22 +671,36 @@ def build_gate_state(
 
     按这条要求，这里只放"事实"，不放"命令"：
 
-    * ``bot`` —— Bot 的显示名与别名。**这是必需的**：没有它，Jev 根本
-      不知道"对着 bot 说"指的是谁，``addressed_to_bot`` 只能靠猜。
-    * ``latest_message`` / ``latest_sender`` —— 触发本次判定的那条消息。
-    * ``recent_messages`` / ``recent_bot_messages`` —— 判断"有没有人接话"、
-      "是不是刚答过"所必需的上下文。
-    * ``bot_mentioned`` —— 平台层面已经确定的事实（被 @ / 被引用），
-      比让模型从文本里猜一个 ``@xxx`` 是否指向自己可靠得多。
+    * ``bot`` —— Bot 的显示名，以及在最新消息里是否被点名。**这是必需的**：
+      没有它，Jev 根本不知道"对着 bot 说"指的是谁，``addressed_to_bot``
+      只能靠猜。
+    * ``latest_*`` —— 触发本次判定的那条消息，含发送者与"多久以前"。
+    * ``recent_messages`` —— 结构化的最近消息（谁说的、是不是 Bot、
+      是不是在叫 Bot、多久以前）。参考 ``reply_gate`` 的做法：只发可见转录，
+      但每条带足够字段，比一堆裸字符串信息量大得多。
+    * ``recent_bot_messages`` —— 判断"是不是刚答过"所必需。
 
     Jev 只吃文本、对英文最稳，但聊天原文保持原样（不改写成英文），
-    避免语义在翻译中丢失。这里只负责裁剪长度与结构化。
+    避免语义在翻译中丢失。这里只负责裁剪与结构化。
     """
-    ctx = [c for c in context if c][-20:]
+    raw_context = list(context or [])
+    # 兼容旧调用：传入纯字符串也接受，包成 ChatLine。
+    lines: list[ChatLine] = [
+        item if isinstance(item, ChatLine) else ChatLine(sender="", text=str(item))
+        for item in raw_context
+        if (item.text if isinstance(item, ChatLine) else str(item))
+    ][-20:]
     bots = [b for b in bot_messages if b][-5:]
 
     def clip(text: str, limit: int) -> str:
         return text if len(text) <= limit else text[-limit:]
+
+    latest_payload: dict[str, object] = {
+        "sender": clip(latest_sender, 80),
+        "text": clip(latest, 2000),
+    }
+    if latest_seconds_ago is not None:
+        latest_payload["seconds_ago"] = round(max(0.0, float(latest_seconds_ago)), 1)
 
     state: dict[str, object] = {
         "group": clip(group_name, 120),
@@ -656,22 +708,49 @@ def build_gate_state(
             "name": clip(bot_name, 80) if bot_name else "",
             "mentioned_in_latest": bool(bot_mentioned),
         },
-        "latest_sender": clip(latest_sender, 80),
-        "latest_message": clip(latest, 2000),
-        "recent_messages": [clip(c, 500) for c in ctx],
+        "latest_message": latest_payload,
+        "recent_messages": [
+            _chat_line_payload(
+                ChatLine(
+                    sender=clip(line.sender, 80),
+                    text=clip(line.text, 500),
+                    is_self=line.is_self,
+                    at_bot=line.at_bot,
+                    seconds_ago=line.seconds_ago,
+                )
+            )
+            for line in lines
+        ],
         "recent_bot_messages": [clip(b, 500) for b in bots],
     }
 
     # 整体再兜一次总长度：state 超过模型上下文会直接 400。
     def size(value: object) -> int:
         if isinstance(value, list):
-            return sum(len(str(item)) for item in value)
+            return sum(
+                sum(len(str(v)) for v in item.values())
+                if isinstance(item, dict)
+                else len(str(item))
+                for item in value
+            )
         if isinstance(value, dict):
             return sum(len(str(v)) for v in value.values())
         return len(str(value))
 
     if sum(size(v) for v in state.values()) > max_chars:
-        state["recent_messages"] = [clip(c, 200) for c in ctx[-5:]]
+        kept = lines[-5:]
+        state["recent_messages"] = [
+            _chat_line_payload(
+                ChatLine(
+                    sender=clip(line.sender, 40),
+                    text=clip(line.text, 200),
+                    is_self=line.is_self,
+                    at_bot=line.at_bot,
+                    seconds_ago=line.seconds_ago,
+                )
+            )
+            for line in kept
+        ]
         state["recent_bot_messages"] = [clip(b, 200) for b in bots[-2:]]
-        state["latest_message"] = clip(latest, 1500)
+        latest_payload["text"] = clip(latest, 1500)
     return state

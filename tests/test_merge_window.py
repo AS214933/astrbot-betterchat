@@ -257,7 +257,9 @@ def test_build_gate_state_clips_long_content() -> None:
     )
     assert len(state["recent_messages"]) <= 20
     assert len(state["recent_bot_messages"]) <= 5
-    assert len(str(state["latest_message"])) <= 2000
+    # latest_message 现在是结构化对象（含 sender/seconds_ago），
+    # 正文本身仍受 2000 字符上限约束。
+    assert len(state["latest_message"]["text"]) <= 2000
 
 
 def test_build_gate_state_shrinks_when_over_budget() -> None:

@@ -25,6 +25,7 @@ from typing import Any
 try:  # 包内导入（AstrBot 正常加载方式）
     from .betterchat_core import (
         Action,
+        ChatLine,
         GroupSettings,
         GroupVerdict,
         MergeSettings,
@@ -45,6 +46,7 @@ try:  # 包内导入（AstrBot 正常加载方式）
 except ImportError:  # 直接以路径加载时的兜底
     from betterchat_core import (
         Action,
+        ChatLine,
         GroupSettings,
         GroupVerdict,
         MergeSettings,
@@ -605,7 +607,24 @@ class BetterChatPlugin(Star):
             "bot_name": self._bot_name(event),
             "latest_sender": self._sender_name(event),
             "bot_mentioned": bool(already_woken),
+            # 平台给了创建时间就带上"多久以前"：Jev 能据此区分
+            # "刚刚正在聊" 和 "5 分钟前没人接的老问题"。
+            "latest_seconds_ago": self._seconds_since_created(event),
         }
+
+    @staticmethod
+    def _seconds_since_created(event: AstrMessageEvent) -> float | None:
+        """消息距今多少秒；平台没给时间就返回 None（不编造 0）。"""
+        import time
+
+        for attr in ("created_at", "timestamp"):
+            try:
+                value = getattr(event.message_obj, attr, None)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(value, (int, float)) and value > 0:
+                return max(0.0, time.time() - float(value))
+        return None
 
     def _bot_name(self, event: AstrMessageEvent) -> str:
         """取 Bot 的显示名。取不到就退回 ID，总比没有强。"""
@@ -650,8 +669,13 @@ class BetterChatPlugin(Star):
         except Exception:  # noqa: BLE001
             return ""
 
-    def _recent_group_messages(self, event: AstrMessageEvent, limit: int) -> list[str]:
-        """取最近的群消息作为判定上下文。
+    def _recent_group_messages(self, event: AstrMessageEvent, limit: int) -> list:
+        """取最近的群消息作为判定上下文（结构化）。
+
+        为什么不是一串裸字符串：判断"该不该接话"时，**谁说的**、**是不是
+        Bot 自己说的**、**多久以前**都直接影响结论 —— 一条 5 分钟前没人接
+        的问题可以主动帮，刚刚别人正聊得热的话题就不该硬插。这也正是
+        ``astrbot_plugin_reply_gate`` 的做法，值得照搬。
 
         AstrBot 没有插件可直接读的"群历史列表"API，这里尝试几个已知的
         存放位置；任何一个取不到就退化为空列表 —— 判定仍然可用，只是
@@ -665,8 +689,37 @@ class BetterChatPlugin(Star):
             except Exception:  # noqa: BLE001
                 continue
             if isinstance(value, list) and value:
-                return [str(item) for item in value[-limit:]]
+                return [self._to_chat_line(item) for item in value[-limit:]]
         return []
+
+    def _to_chat_line(self, item: object) -> object:
+        """把历史消息（对象或字符串）转成 :class:`ChatLine`。"""
+
+        def pick(*names: str) -> str:
+            for name in names:
+                try:
+                    value = getattr(item, name, None)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return ""
+
+        if isinstance(item, str):
+            return ChatLine(sender="", text=item)
+        if isinstance(item, dict):
+            return ChatLine(
+                sender=str(item.get("sender") or item.get("sender_name") or ""),
+                text=str(item.get("text") or item.get("content") or ""),
+                is_self=bool(item.get("is_self") or item.get("is_bot")),
+                at_bot=bool(item.get("at_bot")),
+            )
+        return ChatLine(
+            sender=pick("sender_name", "sender", "nickname"),
+            text=pick("text", "content", "message_str"),
+            is_self=bool(getattr(item, "is_self", False)),
+            at_bot=bool(getattr(item, "at_bot", False)),
+        )
 
     def _recent_bot_messages(self, event: AstrMessageEvent) -> list[str]:
         for getter in ("group_bot_messages", "bot_messages"):

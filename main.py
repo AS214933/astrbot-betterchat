@@ -530,6 +530,7 @@ class BetterChatPlugin(Star):
                 latest=text,
                 context=self._recent_group_messages(event, settings.context_messages),
                 bot_messages=self._recent_bot_messages(event),
+                **self._gate_state_extras(event, already_woken),
             )
             answers = await self.jev.decide(
                 state=state, questions=build_group_questions()
@@ -585,6 +586,55 @@ class BetterChatPlugin(Star):
         if last <= 0:
             return math.inf
         return max(0.0, time.time() - last)
+
+    def _gate_state_extras(
+        self, event: AstrMessageEvent, already_woken: bool
+    ) -> dict[str, object]:
+        """给 ``build_gate_state`` 补上"事实类"上下文。
+
+        这些**不是**提示词，是 Jev 做判断必需的事实：
+
+        * ``bot_name`` —— 不告诉它 Bot 叫什么，``addressed_to_bot``
+          就只能瞎猜"@后面的那串是不是指我"。
+        * ``latest_sender`` —— 区分"谁在说话"，对判断是不是在对 Bot 说
+          很有帮助。
+        * ``bot_mentioned`` —— 平台层面已经确定的事实（被 @ / 被引用 /
+          唤醒词），比让模型从文本里推断可靠得多。
+        """
+        return {
+            "bot_name": self._bot_name(event),
+            "latest_sender": self._sender_name(event),
+            "bot_mentioned": bool(already_woken),
+        }
+
+    def _bot_name(self, event: AstrMessageEvent) -> str:
+        """取 Bot 的显示名。取不到就退回 ID，总比没有强。"""
+        for getter in ("get_self_name", "get_bot_name"):
+            try:
+                value = getattr(event, getter, None)
+                if callable(value):
+                    name = value()
+                    if isinstance(name, str) and name.strip():
+                        return name.strip()
+            except Exception:  # noqa: BLE001
+                continue
+        try:
+            return str(event.get_self_id() or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _sender_name(event: AstrMessageEvent) -> str:
+        try:
+            name = event.get_sender_name()
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return str(event.get_sender_id() or "")
+        except Exception:  # noqa: BLE001
+            return ""
 
     @staticmethod
     def _group_name(event: AstrMessageEvent) -> str:
@@ -743,6 +793,7 @@ class BetterChatPlugin(Star):
                     latest=text,
                     context=self._recent_group_messages(event, settings.context_messages),
                     bot_messages=self._recent_bot_messages(event),
+                    **self._gate_state_extras(event, already_woken),
                 ),
                 questions=build_group_questions(),
             )

@@ -102,6 +102,66 @@ Jev 用极低成本判断这两件事。
   其余                  → 闭嘴
 ```
 
+### 送给 Jev 的是什么
+
+Jev **没有 prompt / system 字段** —— 它只接受三样东西：
+
+| 字段 | 放什么 | 不放什么 |
+|---|---|---|
+| `state` | **事实**：群名、Bot 名字、谁在说话、最近消息 | 规则、命令、"你应该…" |
+| `instructions` | **问什么**，以及看哪一部分（`` `latest_message` ``） | — |
+| `criteria` | **边界定义**：什么算"是"，什么算"否" | — |
+
+官方文档明确要求 `state` 只放与当前问题相关的内容，规则写进
+`instructions` / `criteria`，否则会造成 *distractions* 和 *context rot*。
+本插件按这条执行：
+
+```json
+// state：全是事实
+{
+  "group": "测试群",
+  "bot": { "name": "HexVergeBot", "mentioned_in_latest": true },
+  "latest_sender": "秉鑫",
+  "latest_message": "有人知道这个报错怎么解决吗",
+  "recent_messages": ["刚才那个配置我改了"],
+  "recent_bot_messages": ["在的，怎么了？"]
+}
+```
+
+> **`bot.name` 是必需的。** 不告诉 Jev Bot 叫什么，判断"这话是不是对 Bot
+> 说的"就只能靠猜 `@后面那串` 是不是自己。
+> `mentioned_in_latest` 则是平台层面**已经确定**的事实（被 @ / 被引用 /
+> 唤醒词），比让模型从文本里推断可靠得多。
+
+问题用官方的**结构化写法**（`instructions` 和 `criteria` 的值都支持
+字符串/对象/数组），把"看哪部分"和"按什么标准看"拆成独立字段：
+
+```json
+{
+  "type": "noul",
+  "instructions": {
+    "question": "Is `latest_message` aimed at the assistant (the bot)?",
+    "compare": ["`latest_message`", "`bot`", "`recent_bot_messages`"],
+    "focus": "Look for the bot being named or addressed..."
+  },
+  "criteria": {
+    "true":  { "what": "The message targets the bot itself", "examples": ["..."] },
+    "false": { "what": "Targets other people", "not_for": "..." }
+  }
+}
+```
+
+三个问题的分工（对应官方"拆成原子问题"的要求）：
+
+| 问题 | 回答什么 | 为什么单独问 |
+|---|---|---|
+| `addressed_to_bot` | 这话是冲着 Bot 来的吗 | 决定"该不该接话" |
+| `open_question` | 有没有还没人接的问题 | 决定"能不能主动插话" |
+| `already_answered_by_bot` | 刚是不是已经答过 | 防止重复回复 |
+
+拆开而不是问一个"该不该回复"，是因为后者把三个判断藏在一个数字背后 ——
+既没法单独调阈值，也看不出是哪一步否掉的。
+
 ### 两个渠道
 
 | | TypeSafe 官方 | Cloudflare Workers AI |

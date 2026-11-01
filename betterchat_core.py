@@ -620,12 +620,29 @@ def build_gate_state(
     latest: str,
     context: Iterable[str],
     bot_messages: Iterable[str],
+    bot_name: str = "",
+    latest_sender: str = "",
+    bot_mentioned: bool = False,
     max_chars: int = 6000,
 ) -> dict[str, object]:
     """构造送进 Jev 的 ``state``。
 
-    Jev 只吃纯文本、对英文最稳，但聊天原文保持原样（不改写成英文），
-    这样语义不会在翻译中丢失。这里只负责裁剪长度与结构化。
+    官方文档对 state 的要求很清楚：**只放与当前问题相关的内容**，
+    不要塞无关信息（会造成 distractions 和 context rot）；判断规则应当
+    写进 ``instructions`` / ``criteria``，而不是塞进 state。
+
+    按这条要求，这里只放"事实"，不放"命令"：
+
+    * ``bot`` —— Bot 的显示名与别名。**这是必需的**：没有它，Jev 根本
+      不知道"对着 bot 说"指的是谁，``addressed_to_bot`` 只能靠猜。
+    * ``latest_message`` / ``latest_sender`` —— 触发本次判定的那条消息。
+    * ``recent_messages`` / ``recent_bot_messages`` —— 判断"有没有人接话"、
+      "是不是刚答过"所必需的上下文。
+    * ``bot_mentioned`` —— 平台层面已经确定的事实（被 @ / 被引用），
+      比让模型从文本里猜一个 ``@xxx`` 是否指向自己可靠得多。
+
+    Jev 只吃文本、对英文最稳，但聊天原文保持原样（不改写成英文），
+    避免语义在翻译中丢失。这里只负责裁剪长度与结构化。
     """
     ctx = [c for c in context if c][-20:]
     bots = [b for b in bot_messages if b][-5:]
@@ -635,17 +652,25 @@ def build_gate_state(
 
     state: dict[str, object] = {
         "group": clip(group_name, 120),
+        "bot": {
+            "name": clip(bot_name, 80) if bot_name else "",
+            "mentioned_in_latest": bool(bot_mentioned),
+        },
+        "latest_sender": clip(latest_sender, 80),
         "latest_message": clip(latest, 2000),
         "recent_messages": [clip(c, 500) for c in ctx],
         "recent_bot_messages": [clip(b, 500) for b in bots],
     }
 
     # 整体再兜一次总长度：state 超过模型上下文会直接 400。
-    total = sum(
-        len(str(v)) if not isinstance(v, list) else sum(len(str(i)) for i in v)
-        for v in state.values()
-    )
-    if total > max_chars:
+    def size(value: object) -> int:
+        if isinstance(value, list):
+            return sum(len(str(item)) for item in value)
+        if isinstance(value, dict):
+            return sum(len(str(v)) for v in value.values())
+        return len(str(value))
+
+    if sum(size(v) for v in state.values()) > max_chars:
         state["recent_messages"] = [clip(c, 200) for c in ctx[-5:]]
         state["recent_bot_messages"] = [clip(b, 200) for b in bots[-2:]]
         state["latest_message"] = clip(latest, 1500)

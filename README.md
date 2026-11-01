@@ -168,35 +168,39 @@ Jev **没有 prompt / system 字段** —— 它只接受三样东西：
 |---|---|---|---|
 | 端点 | `api.typesafe.ai/v1/systemone` | `.../accounts/{id}/ai/run` | `opencode.ai/inference/systemone/v1/systemone` |
 | 请求形状 | `{model, state, questions}` | `{model, input:{state, questions}}` | `{model, state, questions}` |
-| 需要 | API Key | 账号 ID + Token | Console API Key |
-| 免费可用 | 按量计费（很便宜） | ❌ 免费额度不覆盖第三方模型 | ❌ 见下 |
+| 需要 | API Key | 账号 ID + Token | Console key（`oc_sk_` 开头） |
+| 免费可用 | ❌（但很便宜） | ❌ 免费额度不覆盖第三方模型 | ✅ **`jev-1.13-free` 免费** |
 
-#### 关于 OpenCode 的"免费 jev" —— 用不了
+#### OpenCode 免费 jev —— 可以用，但必须带齐三个东西
 
-`jev-1.13-free` 确实存在，但**被服务端限制为只能在 OpenCode 客户端内使用**。实测：
+`jev-1.13-free` **是可以从插件调用的**（实测返回 200 且 `usage.cost == 0`），
+但少任何一个条件都会失败，而且失败信息很有迷惑性：
 
-| 尝试 | 结果 |
+| 必需项 | 缺了会怎样 |
 |---|---|
-| 直连 `jev-1.13-free` | `429 FreeUsageLimitError` |
-| 伪装成 OpenCode 的 User-Agent | 仍然 429（服务端按账号/网络判断，不是靠 UA） |
-| 直连付费 `jev-1.13` | `401` 需要 API Key ✅ |
+| `Authorization: Bearer oc_sk_…` | `401` |
+| `x-opencode-session: <uuid>` | `400 MissingSessionID` ← 不是 401，容易误判成权限问题 |
+| 正常的 `User-Agent` | `403 error code: 1010` ← Cloudflare 拦 `Python-urllib`/`aiohttp` 默认 UA，看着像 key 无效 |
 
-官方文档原话：*"Free-tier chat models require OpenCode; use paid models or **Go** from other clients."*
+**本插件已自动处理这三项**，你只需要在面板填 `oc_api_key`。
 
-#### 关于 OpenCode Go —— 也没有 Jev
+实测判断质量示例（免费模型，cost 0）：
 
-Go 订阅（$10/月）虽然允许第三方客户端调用，但**它的模型清单里没有 Jev**。实测：
+| 消息 | addressed | open_q | 结论 |
+|---|---|---|---|
+| 有人知道这个报错怎么解决吗 | 0.05 | **0.97** | respond（主动帮） |
+| HexVergeBot 帮我看下这个 | **0.96** | 0.81 | respond（被叫到） |
+| 哈哈哈笑死 | 0.03 | 0.02 | ignore（不打扰） |
 
-- 拉取 `opencode.ai/zen/v1/models`，78 个模型里**没有任何 jev**
-- 带 session 头打 Go 路由 → `Model is unavailable`
-- Go 页面列出的模型只有 Kimi / GLM / DeepSeek / MiMo / Claude Haiku 等编码模型
+> ⚠️ **限时免费 + 未公开用量上限。** 用尽后返回 `429 FreeUsageLimitError`，
+> OpenCode 没有公布上限大小和重置时间。用尽时可切付费 `jev-1.13`
+> （需账户余额），或改用 TypeSafe 官方渠道。
 
-所以**本插件不为 Go 提供单独渠道**——不是没做，是它确实没有这个模型。
+#### OpenCode Go 里没有 Jev
 
-#### OpenCode 渠道的实际用途
-
-只能走付费 `jev-1.13` + Console API Key。适合已经在用 OpenCode、账户里已有余额的人。如果没有，**直接用 TypeSafe 官方渠道更省事**。
-
+Go 订阅（$10/月）虽然允许第三方客户端调用，但**它的模型清单里没有 Jev**。
+实测：`opencode.ai/zen/v1/models` 返回 78 个模型，无一含 jev；带 session 头打
+Go 路由返回 `Model is unavailable`。所以不为 Go 单独做渠道。
 
 ### 降级：任何失败都不影响可用性
 

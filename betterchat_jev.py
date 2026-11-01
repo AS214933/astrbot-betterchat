@@ -41,22 +41,31 @@ __all__ = [
 
 DEFAULT_OFFICIAL_BASE = "https://api.typesafe.ai"
 DEFAULT_CF_BASE = "https://api.cloudflare.com/client/v4/accounts"
-#: OpenCode 的 System One 端点。实测三个渠道的结论：
+#: OpenCode 的 System One 端点。
 #:
-#: * ``official``  —— ``POST {api_base}/v1/systemone``，最省心
-#: * ``cloudflare``—— ``POST .../ai/run``（第三方模型需预付额度）
-#: * ``opencode``  —— ``POST {oc_api_base}/systemone``，**需要付费 key**
+#: **``jev-1.13-free`` 是可以从第三方程序调用的**，但必须同时满足三件事，
+#: 少一件就会失败（这三个都是实测出来的，缺一不可）：
 #:
-#: 关于 OpenCode 的免费/Go：
+#: 1. ``Authorization: Bearer <oc_sk_...>`` —— 需要 OpenCode Console 的 key。
+#: 2. ``x-opencode-session: <uuid>`` —— 稳定的会话 ID。**缺少它返回 400
+#:    "MissingSessionID"**，而不是 401，很容易误判成权限问题。
+#: 3. 正常的 ``User-Agent`` —— 默认的 ``Python-urllib/x.y`` 会被 Cloudflare
+#:    拦成 ``403 error code: 1010``（浏览器完整性校验），看起来像 key 无效。
 #:
-#: * ``jev-1.13-free``：服务端限制为**只能在 OpenCode 客户端内**使用，
-#:   第三方程序调用一律 ``429 FreeUsageLimitError``，伪装 User-Agent 无效。
-#: * ``OpenCode Go`` 订阅：模型清单里**没有 Jev**（实测 78 个模型无一含 jev），
-#:   打 Go 路由会返回 ``Model is unavailable``，因此本插件不为 Go 提供单独渠道。
+#: 满足之后 ``jev-1.13-free`` 返回 200，且 ``usage.cost == 0``。
 #:
-#: 所以 OpenCode 渠道唯一可用的形态是：付费 ``jev-1.13`` + Console API Key。
+#: 另外：
+#:
+#: * 付费 ``jev-1.13`` 需要账户有余额，否则 ``402 Insufficient account funds``。
+#: * ``OpenCode Go`` 订阅里**没有 Jev**（78 个模型无一含 jev；打 Go 路由返回
+#:   ``Model is unavailable``），所以不为 Go 单独做渠道。
 DEFAULT_OC_BASE = "https://opencode.ai/inference/systemone/v1"
-DEFAULT_OC_MODEL = "jev-1.13"
+DEFAULT_OC_MODEL = "jev-1.13-free"
+
+#: 调用 OpenCode 时必须携带的 User-Agent。
+#: 用 ``Python/3.x aiohttp/...`` 这类默认值会被 Cloudflare 的浏览器完整性
+#: 校验拦成 ``403 error code: 1010``，看着像 key 无效，其实是 UA 被拒。
+OPENCODE_USER_AGENT = "opencode/1.17.7"
 DEFAULT_MODEL = "jev-latest"
 DEFAULT_CF_MODEL = "typesafe/jev"
 OFFICIAL_PATH = "/v1/systemone"
@@ -168,7 +177,7 @@ class JevConfig:
                 return None
             # 免费模型无法从插件调用（服务端限制只在 OpenCode 客户端内可用），
             # 因此没有 key 就没有任何可用路径，直接禁用比反复 429 体验好。
-            return "缺少配置: oc_api_key（OpenCode 的免费 jev 只能在 OpenCode 客户端内使用）"
+            return "缺少配置: oc_api_key（去 opencode.ai 的 Console 生成一个 oc_sk_ 开头的 key）"
         if not self.api_key:
             return "缺少配置: api_key"
         return None
@@ -192,8 +201,9 @@ class JevConfig:
             return f"{DEFAULT_CF_BASE}/{account}/ai/run"
 
         if self.channel == "opencode":
-            # 官方 model 文件给出的 base_url 是
+            # models.dev 的 jev-1.13-free.toml 给出的 base_url 是
             # https://opencode.ai/inference/systemone/v1，System One 路径是 /systemone。
+            # /zen/v1/systemone 也能通，但官方 model 文件写的是前者，以它为准。
             base = self.oc_api_base.strip().rstrip("/")
             if base.endswith("/systemone"):
                 return base
@@ -338,6 +348,9 @@ class JevClient:
         self._closed = False
         self.last_error: str | None = None
         self._clock = time.monotonic
+        #: OpenCode 会话 ID。固定不变 = 这个 Bot 视为一个会话，
+        #: 便于它做路由与提示缓存。
+        self._session_id = _new_session_id()
 
     # -- 状态 ------------------------------------------------------------- #
 
@@ -503,6 +516,17 @@ class JevClient:
             "Authorization": f"Bearer {self.config.auth_token()}",
             "Content-Type": "application/json",
         }
+        if self.config.channel == "opencode":
+            # 这两个头是**必需的**，缺任何一个都调用不通（实测）：
+            #
+            # * ``x-opencode-session``：缺了返回 400 MissingSessionID。
+            #   同一个会话应复用同一个 ID（OpenCode 用它做路由与缓存），
+            #   这里按客户端实例固定一个，等价于"这一个 Bot 是一个会话"。
+            # * ``User-Agent``：aiohttp 的默认 UA（``Python/3.x aiohttp/3.x``）
+            #   会被 Cloudflare 浏览器完整性校验拦成 403 error code 1010，
+            #   看起来像 key 无效，实际是 UA 被拒。
+            headers["x-opencode-session"] = self._session_id
+            headers["User-Agent"] = OPENCODE_USER_AGENT
         async with session.post(
             self.config.endpoint(),
             json=payload,
@@ -555,19 +579,41 @@ def _explain_http_error(*, status: int, body: str, channel: str) -> str:
             )
 
     if channel == "opencode":
-        # 429 FreeUsageLimitError：免费模型只能从 OpenCode 客户端内调用。
-        if "FreeUsageLimit" in body or "free tier" in body.lower():
+        # 403 + error code 1010：Cloudflare 浏览器完整性校验拦截，通常是 UA 太少见。
+        if "1010" in body:
             return (
-                f"OpenCode 拒绝请求（HTTP {status}）。"
-                "免费模型（jev-1.13-free 等）被服务端限制为**只能在 OpenCode "
-                "客户端内**使用，第三方程序调用会直接返回 FreeUsageLimitError，"
-                "伪装 User-Agent 也无效。插件里请改填付费模型 jev-1.13 并配置 "
-                "OpenCode 的 API Key，或改用「TypeSafe 官方」渠道。原始响应: "
-                f"{summary}"
+                f"被 Cloudflare 拦截（HTTP {status}, code 1010）。"
+                "通常是请求的 User-Agent 被判定为异常客户端。"
+                "本插件已固定使用 OpenCode 的 UA，若仍出现请检查是否有代理改写了请求头。"
+                f"原始响应: {summary}"
+            )
+        # 400 MissingSessionID：缺少 x-opencode-session 头。
+        if "MissingSessionID" in body:
+            return (
+                f"OpenCode 缺少会话标识（HTTP {status}）。"
+                "请求必须带 x-opencode-session 头；本插件已自动附加，"
+                f"若仍出现说明请求链路被改写了。原始响应: {summary}"
+            )
+        # 402：账户余额不足（付费模型）。
+        if status == 402 or "Insufficient account funds" in body:
+            return (
+                f"OpenCode 账户余额不足（HTTP {status}）。"
+                "付费模型 jev-1.13 需要账户有余额；"
+                "若想免费使用，把模型改成 jev-1.13-free。"
+                f"原始响应: {summary}"
+            )
+        # 429：免费额度用尽（限时免费模型有未公开的用量上限）。
+        if "FreeUsageLimit" in body or status == 429:
+            return (
+                f"OpenCode 免费额度已用尽（HTTP {status}）。"
+                "jev-1.13-free 是限时免费，有未公开的用量上限，用尽后需等待重置，"
+                "或切到付费 jev-1.13（需账户余额），或改用「TypeSafe 官方」渠道。"
+                f"原始响应: {summary}"
             )
         if "AuthError" in body or status == 401:
             return (
-                f"OpenCode 认证失败（HTTP {status}），请检查 oc_api_key。原始响应: {summary}"
+                f"OpenCode 认证失败（HTTP {status}），请检查 oc_api_key 是否正确。"
+                f"原始响应: {summary}"
             )
 
     if status == 401:
@@ -586,6 +632,13 @@ def aiohttp_timeout(seconds: float) -> Any:
     import aiohttp
 
     return aiohttp.ClientTimeout(total=seconds)
+
+
+def _new_session_id() -> str:
+    """生成一个 UUID4 字符串作为 OpenCode 会话 ID。"""
+    import uuid
+
+    return str(uuid.uuid4())
 
 
 def _summarize(value: object, limit: int = 200) -> str:

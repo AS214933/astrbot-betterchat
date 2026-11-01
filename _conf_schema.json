@@ -235,7 +235,7 @@
       "channel": {
         "type": "string",
         "description": "渠道",
-        "hint": "三个渠道的模型版本可能不同步，切换后请看日志确认实际生效的 endpoint 与模型。OpenCode 的免费模型（jev-1.13-free）被服务端限制为只能在 OpenCode 客户端内使用，第三方程序调用会返回 FreeUsageLimitError，因此这里只能用付费模型。",
+        "hint": "三个渠道的模型版本可能不同步，切换后请看日志确认实际生效的 endpoint 与模型。OpenCode 渠道用 oc_sk_ 开头的 Console key；jev-1.13-free 是限时免费，有未公开的用量上限，用尽后需等待重置或改用付费 jev-1.13。",
         "default": "official",
         "options": [
           "official",
@@ -250,7 +250,7 @@
         "subtitles": [
           "直连 api.typesafe.ai，默认 jev-latest。最省心的免费路径",
           "经 Cloudflare 转发；免费 Neurons 不覆盖第三方模型，需预付额度",
-          "OpenCode 的付费 jev-1.13；注意免费版 jev-1.13-free 无法从插件调用"
+          "OpenCode 的 jev（免费版 jev-1.13-free 可直接用，需 Console key）"
         ]
       },
       "api_key": {
@@ -294,7 +294,7 @@
       "oc_api_key": {
         "type": "string",
         "description": "OpenCode API Key",
-        "hint": "OpenCode Zen/Console 的 API Key。免费模型无法从插件调用，必须配 key 才能用付费 jev-1.13。",
+        "hint": "OpenCode Console 的 API Key（oc_sk_ 开头）。配好后 jev-1.13-free 可直接免费调用。",
         "default": "",
         "secret": true
       },
@@ -307,8 +307,8 @@
       "oc_model": {
         "type": "string",
         "description": "OpenCode 模型",
-        "hint": "填 jev-1.13（付费）。不要填 jev-1.13-free —— 免费版只能在 OpenCode 客户端内使用。",
-        "default": "jev-1.13"
+        "hint": "jev-1.13-free（限时免费，推荐）或 jev-1.13（需账户余额）。注意免费模型有未公开的用量上限，用尽后需等待重置。",
+        "default": "jev-1.13-free"
       },
       "timeout_seconds": {
         "type": "float",

@@ -613,12 +613,12 @@ def test_opencode_endpoint_accepts_full_path() -> None:
     assert not config.endpoint().endswith("/systemone/systemone")
 
 
-def test_opencode_requires_key_because_free_tier_is_walled() -> None:
+def test_opencode_requires_key() -> None:
     """没有 key 就直接禁用。
 
-    OpenCode 的免费模型（``jev-1.13-free``）被服务端限制为只能在
-    OpenCode 客户端内使用，第三方调用一律 429 ``FreeUsageLimitError``。
-    与其每条群消息都撞一次 429，不如在配置阶段就明确禁用。
+    实测 ``jev-1.13-free`` 从第三方调用是**可以**的（返回 200、cost 0），
+    但必须带 ``Authorization`` / ``x-opencode-session`` / 正常 UA 三件套。
+    没有 key 时连第一件都缺，与其每条群消息撞一次 401，不如配置阶段就禁用。
     """
     config = JevConfig.from_config({"channel": "opencode"})
     missing = config.ready_missing()
@@ -626,7 +626,7 @@ def test_opencode_requires_key_because_free_tier_is_walled() -> None:
     assert "oc_api_key" in missing
 
 
-def test_opencode_free_usage_error_is_explained() -> None:
+def test_opencode_free_usage_limit_is_explained() -> None:
     """429 FreeUsageLimitError 要给出可操作的解释，而不是原始 JSON。"""
     from betterchat_jev import _explain_http_error
 
@@ -638,10 +638,46 @@ def test_opencode_free_usage_error_is_explained() -> None:
         ),
         channel="opencode",
     )
-    assert "只能在 OpenCode" in message
-    # 必须指向真正可行的两条路。
+    assert "免费额度已用尽" in message
     assert "jev-1.13" in message
     assert "TypeSafe 官方" in message
+
+
+def test_opencode_cloudflare_1010_is_explained() -> None:
+    """403 code 1010 是 UA 被 Cloudflare 拦了，不是 key 无效。"""
+    from betterchat_jev import _explain_http_error
+
+    message = _explain_http_error(
+        status=403, body="error code: 1010", channel="opencode"
+    )
+    assert "Cloudflare" in message
+    assert "User-Agent" in message
+
+
+def test_opencode_missing_session_header_is_explained() -> None:
+    """400 MissingSessionID：缺 x-opencode-session，不是权限问题。"""
+    from betterchat_jev import _explain_http_error
+
+    message = _explain_http_error(
+        status=400,
+        body='{"type":"error","error":{"type":"MissingSessionID","message":"..."}}',
+        channel="opencode",
+    )
+    assert "会话标识" in message
+    assert "x-opencode-session" in message
+
+
+def test_opencode_insufficient_funds_is_explained() -> None:
+    """402 余额不足时提示可以直接换免费模型。"""
+    from betterchat_jev import _explain_http_error
+
+    message = _explain_http_error(
+        status=402,
+        body='{"error":{"type":"server_error","message":"Upstream request failed: Insufficient account funds"}}',
+        channel="opencode",
+    )
+    assert "余额不足" in message
+    assert "jev-1.13-free" in message
 
 
 def test_build_questions_have_no_hardcoded_version_dependency() -> None:
@@ -649,7 +685,8 @@ def test_build_questions_have_no_hardcoded_version_dependency() -> None:
     from betterchat_jev import DEFAULT_MODEL, DEFAULT_OC_MODEL
 
     assert DEFAULT_MODEL == "jev-latest"
-    assert DEFAULT_OC_MODEL == "jev-1.13"
+    # OpenCode 默认走免费模型（实测可从第三方调用，cost 0）。
+    assert DEFAULT_OC_MODEL == "jev-1.13-free"
 
 
 def test_active_model_reflects_channel() -> None:
@@ -670,6 +707,88 @@ def test_active_model_reflects_channel() -> None:
         ).active_model()
         == "jev-1.13"
     )
+
+
+def test_opencode_headers_are_attached() -> None:
+    """OpenCode 请求必须带 x-opencode-session 与正常 UA。
+
+    这两个头是实测出来的**硬性要求**，缺任何一个都调不通：
+
+    * 缺 ``x-opencode-session`` → 400 ``MissingSessionID``
+    * 用 ``Python-urllib`` / ``aiohttp`` 默认 UA → 403 ``error code: 1010``
+      （Cloudflare 浏览器完整性校验，看着像 key 无效）
+
+    这里拦截 aiohttp 的 post，检查真实发出的头。
+    """
+
+    class FakeResponse:
+        status = 200
+
+        async def json(self, **_kw):
+            return {"model": "jev-1.13-free", "answers": {"should_reply": {"type": "noul", "noul": 0.5}}}
+
+        async def text(self):
+            return ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        closed = False
+
+        def __init__(self) -> None:
+            self.captured: dict = {}
+
+        def post(self, url, **kwargs):
+            self.captured["url"] = url
+            self.captured["headers"] = kwargs.get("headers") or {}
+            return FakeResponse()
+
+    config = JevConfig.from_config(
+        {"channel": "opencode", "oc_api_key": "oc_sk_test", "oc_model": "jev-1.13-free"}
+    )
+
+    async def scenario():
+        client = JevClient(config)
+        session = FakeSession()
+        client._session = session  # type: ignore[assignment]  # noqa: SLF001
+        await client.decide(state={"a": 1}, questions=QUESTIONS)
+        return session.captured
+
+    captured = run(scenario())
+    headers = captured["headers"]
+
+    # 认证头
+    assert headers["Authorization"] == "Bearer oc_sk_test"
+    # 会话头：非空，且形如 UUID
+    session_id = headers.get("x-opencode-session")
+    assert session_id, "缺少 x-opencode-session 会被拒"
+    assert len(session_id.split("-")) == 5, "会话 ID 应为 UUID 形式"
+    # UA：不能是 aiohttp / python 的默认值
+    ua = headers.get("User-Agent", "")
+    assert ua.startswith("opencode/"), f"UA 会被 Cloudflare 拦截: {ua!r}"
+    assert "aiohttp" not in ua.lower()
+    assert "python" not in ua.lower()
+
+
+def test_opencode_session_id_is_stable_across_calls() -> None:
+    """同一个客户端实例复用同一个会话 ID（便于路由与缓存）。"""
+
+    async def scenario():
+        client = JevClient(
+            JevConfig.from_config(
+                {"channel": "opencode", "oc_api_key": "k", "oc_model": "jev-1.13-free"}
+            )
+        )
+        return client._session_id  # noqa: SLF001
+
+    first = run(scenario())
+    assert first
+    # 新建客户端会换一个，但实例内固定。
+    assert run(scenario()) != first
 
 
 def test_question_payload_omits_absent_criteria() -> None:

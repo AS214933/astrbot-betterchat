@@ -1,0 +1,5 @@
+# BetterChat 运行依赖
+#
+# aiohttp 由 AstrBot 运行环境自带，这里显式声明以固定语义。
+# 本插件不引入任何 AstrBot 未提供的第三方依赖。
+aiohttp>=3.9.0

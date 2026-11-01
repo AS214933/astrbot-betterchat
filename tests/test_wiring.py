@@ -1,0 +1,632 @@
+"""接线层测试：用 stub 的 astrbot 模块加载 ``main.py``。
+
+这不是集成测试，目的只有一个 —— 在**没有装 AstrBot 的环境里**也能证明：
+
+1. ``main.py`` 能被 import（没有拼错的属性名、没有循环导入）；
+2. 插件类能被实例化，且 ``__init__`` 不做任何 IO；
+3. 每个钩子的**参数签名**与 AstrBot 源码里的调用方式一致；
+4. 关键决策路径调用的 API 语义正确（特别是 ``should_call_llm`` 那个
+   反直觉的反向语义）。
+
+stub 里的签名都是从 AstrBot master 源码抄来的，不是猜的。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import enum
+import importlib
+import sys
+import types
+import pathlib
+
+import pytest
+
+
+# --------------------------------------------------------------------------- #
+# 构造 astrbot stub
+# --------------------------------------------------------------------------- #
+
+
+class _EventMessageType(enum.Flag):
+    GROUP_MESSAGE = enum.auto()
+    PRIVATE_MESSAGE = enum.auto()
+    OTHER_MESSAGE = enum.auto()
+    ALL = GROUP_MESSAGE | PRIVATE_MESSAGE | OTHER_MESSAGE
+
+
+class _Plain:
+    """对应 ``astrbot.core.message.components.Plain``。"""
+
+    type = "Plain"
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _Logger:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str]] = []
+
+    def info(self, msg: str, *a, **k) -> None:
+        self.records.append(("info", str(msg)))
+
+    def warning(self, msg: str, *a, **k) -> None:
+        self.records.append(("warning", str(msg)))
+
+    def error(self, msg: str, *a, **k) -> None:
+        self.records.append(("error", str(msg)))
+
+    def debug(self, msg: str, *a, **k) -> None:
+        self.records.append(("debug", str(msg)))
+
+
+def _make_filter_hooks() -> types.SimpleNamespace:
+    """过滤器装饰器全部返回 identity 装饰器，并把 kwargs 记下来。
+
+    签名照抄 AstrBot ``astrbot/core/star/register/star_handler.py``：
+    ``register_event_message_type(event_message_type, **kwargs)`` 与
+    ``register_command(command_name=None, **kwargs)`` 都接受位置参数，
+    其余钩子只接受 kwargs。
+    """
+
+    calls: list[tuple[str, dict]] = []
+
+    def make_kwargs_only(name: str):
+        def factory(**kwargs):
+            calls.append((name, kwargs))
+
+            def decorator(func):
+                func.__hook__ = name
+                return func
+
+            return decorator
+
+        return factory
+
+    def event_message_type(event_message_type, **kwargs):
+        calls.append(("event_message_type", {"type": event_message_type, **kwargs}))
+
+        def decorator(func):
+            func.__hook__ = "event_message_type"
+            return func
+
+        return decorator
+
+    def command(command_name=None, **kwargs):
+        calls.append(("command", {"name": command_name, **kwargs}))
+
+        def decorator(func):
+            func.__hook__ = "command"
+            return func
+
+        return decorator
+
+    hooks = types.SimpleNamespace(
+        on_waiting_llm_request=make_kwargs_only("on_waiting_llm_request"),
+        on_llm_request=make_kwargs_only("on_llm_request"),
+        on_decorating_result=make_kwargs_only("on_decorating_result"),
+        event_message_type=event_message_type,
+        command=command,
+    )
+    hooks.EventMessageType = _EventMessageType
+    hooks._calls = calls  # noqa: SLF001 - 测试用
+    return hooks
+
+
+class FakeConfig(dict):
+    """最简 AstrBotConfig 替身：就是 dict，带 save_config。"""
+
+    def save_config(self, *_a, **_k) -> None:
+        pass
+
+
+class FakeEvent:
+    """按真实 ``AstrMessageEvent`` 的语义实现的替身。"""
+
+    def __init__(self, text: str = "你好", *, group: bool = False) -> None:
+        self.message_str = text
+        self.message_obj = types.SimpleNamespace(
+            message=[_Plain(text)], message_str=text, raw_message=None
+        )
+        self.unified_msg_origin = f"test:{'group' if group else 'private'}:1"
+        self._group = group
+        self.call_llm = False
+        self.is_at_or_wake_command = False
+        self._stopped = False
+        self._extras: dict = {}
+        self.is_wake = False
+
+    # -- 真实 API -------------------------------------------------------- #
+
+    def is_private_chat(self) -> bool:
+        return not self._group
+
+    def get_platform_name(self) -> str:
+        return "stub"
+
+    def get_self_id(self) -> str:
+        return "bot"
+
+    def get_sender_id(self) -> str:
+        return "user"
+
+    def get_group_id(self) -> str:
+        return "g1" if self._group else ""
+
+    def is_admin(self) -> bool:
+        return False
+
+    def is_stopped(self) -> bool:
+        return self._stopped
+
+    def stop_event(self) -> None:
+        self._stopped = True
+
+    def should_call_llm(self, value: bool) -> None:
+        # 语义与源码一致：True == 禁止默认 LLM。
+        self.call_llm = value
+
+    def set_extra(self, key, value) -> None:
+        self._extras[key] = value
+
+    def get_extra(self, key=None, default=None):
+        if key is None:
+            return self._extras
+        return self._extras.get(key, default)
+
+    def plain_result(self, text: str):
+        return types.SimpleNamespace(chain=[_Plain(text)], _text=text)
+
+    def get_result(self):
+        return self._result
+
+    _result = None
+
+
+def install_stub() -> types.SimpleNamespace:
+    """把假的 astrbot 包塞进 sys.modules。"""
+    logger = _Logger()
+
+    astrbot = types.ModuleType("astrbot")
+    api = types.ModuleType("astrbot.api")
+    api.logger = logger
+    api.AstrBotConfig = FakeConfig
+
+    event_mod = types.ModuleType("astrbot.api.event")
+    event_mod.AstrMessageEvent = FakeEvent
+    hooks = _make_filter_hooks()
+    event_mod.filter = hooks
+
+    star_mod = types.ModuleType("astrbot.api.star")
+
+    class Star:
+        def __init__(self, context) -> None:
+            self.context = context
+
+    star_mod.Star = Star
+    star_mod.Context = object
+
+    comps = types.ModuleType("astrbot.api.message_components")
+    comps.Plain = _Plain
+
+    core = types.ModuleType("astrbot.core")
+    utils = types.ModuleType("astrbot.core.utils")
+    path_mod = types.ModuleType("astrbot.core.utils.astrbot_path")
+    path_mod.get_astrbot_plugin_data_path = lambda: "/tmp/betterchat-test"
+    utils.astrbot_path = path_mod
+
+    registry_mod = types.ModuleType("astrbot.core.utils.active_event_registry")
+
+    class Registry:
+        def __init__(self) -> None:
+            self.stopped: list[tuple[str, object]] = []
+
+        def request_agent_stop_all(self, umo, exclude=None):
+            self.stopped.append((umo, exclude))
+            return 1
+
+    registry = Registry()
+    registry_mod.active_event_registry = registry
+
+    modules = {
+        "astrbot": astrbot,
+        "astrbot.api": api,
+        "astrbot.api.event": event_mod,
+        "astrbot.api.star": star_mod,
+        "astrbot.api.message_components": comps,
+        "astrbot.core": core,
+        "astrbot.core.utils": utils,
+        "astrbot.core.utils.astrbot_path": path_mod,
+        "astrbot.core.utils.active_event_registry": registry_mod,
+    }
+    sys.modules.update(modules)
+    return types.SimpleNamespace(
+        logger=logger, hooks=hooks, registry=registry, modules=modules
+    )
+
+
+@pytest.fixture(scope="module")
+def loaded():
+    """加载 ``main.py``，测试结束后还原 sys.modules。"""
+    stub = install_stub()
+    root = pathlib.Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+    for name in list(sys.modules):
+        if name.startswith("betterchat"):
+            del sys.modules[name]
+    module = importlib.import_module("main")
+    yield types.SimpleNamespace(module=module, stub=stub)
+    for name in [*stub.modules, "main"]:
+        sys.modules.pop(name, None)
+    if str(root) in sys.path:
+        sys.path.remove(str(root))
+
+
+def base_config() -> dict:
+    return {
+        "enabled": True,
+        "private": {"enable": True},
+        "interrupt": {"enable": True, "mode": "graceful"},
+        "group": {"enable": True},
+        "jev": {"channel": "official", "api_key": ""},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 加载与实例化
+# --------------------------------------------------------------------------- #
+
+
+def test_module_imports_and_registers_hooks(loaded) -> None:
+    names = {name for name, _ in loaded.stub.hooks._calls}  # noqa: SLF001
+    assert "on_waiting_llm_request" in names
+    assert "on_llm_request" in names
+    assert "on_decorating_result" in names
+    assert "event_message_type" in names
+    assert "command" in names
+
+
+def test_plugin_instantiates_without_io(loaded) -> None:
+    plugin = loaded.module.BetterChatPlugin(context=None, config=FakeConfig(base_config()))
+    assert plugin._enabled() is True  # noqa: SLF001
+    # 没配 key：闸门应自我禁用，而不是抛错。
+    assert plugin.jev.config.ready_missing() is not None
+
+
+def test_plugin_survives_empty_config(loaded) -> None:
+    plugin = loaded.module.BetterChatPlugin(context=None, config=None)
+    assert plugin._enabled() is True  # noqa: SLF001
+    assert plugin._group_settings().enable is True  # noqa: SLF001
+
+
+def test_plugin_survives_garbage_config(loaded) -> None:
+    """面板配置被手改坏时，插件必须还能起来。"""
+    config = FakeConfig(
+        {
+            "enabled": "yes",
+            "private": "oops",
+            "group": [1, 2, 3],
+            "jev": {"timeout_seconds": "abc", "reply_threshold": float("nan")},
+        }
+    )
+    plugin = loaded.module.BetterChatPlugin(context=None, config=config)
+    assert plugin._merge_settings().base_quiet_seconds == 2.0  # noqa: SLF001
+    assert plugin.jev.config.timeout_seconds == 3.0
+    assert plugin.jev.config.reply_threshold == 0.7
+
+
+# --------------------------------------------------------------------------- #
+# should_call_llm 的反向语义
+# --------------------------------------------------------------------------- #
+
+
+def test_take_over_and_hand_back_helpers(loaded) -> None:
+    """``should_call_llm`` 语义是反的：True 表示禁止默认 LLM。"""
+    plugin = loaded.module.BetterChatPlugin(context=None, config=FakeConfig(base_config()))
+    event = FakeEvent()
+
+    plugin._let_astrbot_handle(event)  # noqa: SLF001
+    assert event.call_llm is False  # 不禁止 => 走原生 LLM
+
+    plugin._take_over_turn(event)  # noqa: SLF001
+    assert event.call_llm is True  # 禁止 => 原生 LLM 不跑
+
+
+# --------------------------------------------------------------------------- #
+# 合并路径
+# --------------------------------------------------------------------------- #
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+def test_single_private_message_passes_through(loaded) -> None:
+    """单条消息：窗口到期后合并文本写回事件，并交还原生流程。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.01,
+            "min_quiet_seconds": 0.01,
+            "max_quiet_seconds": 0.02,
+            "total_seconds": 0.05,
+        }
+        plugin = loaded.module.BetterChatPlugin(context=None, config=config)
+        event = FakeEvent("你好")
+        await plugin.on_waiting_llm(event)
+        return event
+
+    event = run(scenario())
+    assert event.message_str == "你好"
+    # OWNER 分支必须交还原生流程（call_llm=False）。
+    assert event.call_llm is False
+
+
+def test_command_message_bypasses_merge(loaded) -> None:
+    async def scenario():
+        plugin = loaded.module.BetterChatPlugin(
+            context=None, config=FakeConfig(base_config())
+        )
+        event = FakeEvent("/help")
+        await plugin.on_waiting_llm(event)
+        return event
+
+    event = run(scenario())
+    # 指令不参与合并：不应被本插件禁止 LLM，也不该进窗口。
+    assert event.call_llm is False
+
+
+def test_group_gate_ignores_when_jev_unconfigured(loaded) -> None:
+    """没配 key：群聊主动插话必须自我禁用，且不回复。"""
+
+    async def scenario():
+        plugin = loaded.module.BetterChatPlugin(
+            context=None, config=FakeConfig(base_config())
+        )
+        event = FakeEvent("这是一个正常的群聊消息", group=True)
+        await plugin.on_group_message(event)
+        return event
+
+    event = run(scenario())
+    assert event.call_llm is True  # 禁止默认 LLM => 不回复
+    assert event.is_at_or_wake_command is False
+
+
+def test_group_gate_lets_woken_message_through_when_jev_down(loaded) -> None:
+    """被 @ 的消息即使 Jev 不可用也要放行 —— 不能因为判定服务挂了就不理人。"""
+
+    async def scenario():
+        plugin = loaded.module.BetterChatPlugin(
+            context=None, config=FakeConfig(base_config())
+        )
+        event = FakeEvent("这是一个正常的群聊消息", group=True)
+        event.is_at_or_wake_command = True
+        await plugin.on_group_message(event)
+        return event
+
+    event = run(scenario())
+    # 失败策略：already_woken => RESPOND => 不被禁止。
+    assert event.call_llm is False
+    assert event.is_at_or_wake_command is True
+
+
+def test_group_gate_disabled_by_config(loaded) -> None:
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {"enable": False}
+        plugin = loaded.module.BetterChatPlugin(context=None, config=config)
+        event = FakeEvent("这是一个正常的群聊消息", group=True)
+        await plugin.on_group_message(event)
+        return event
+
+    event = run(scenario())
+    # 完全不动事件。
+    assert event.call_llm is False
+    assert event.is_at_or_wake_command is False
+
+
+# --------------------------------------------------------------------------- #
+# 打断路径
+# --------------------------------------------------------------------------- #
+
+
+def test_interrupt_marks_previous_event_stale(loaded) -> None:
+    async def scenario():
+        plugin = loaded.module.BetterChatPlugin(
+            context=None, config=FakeConfig(base_config())
+        )
+        first = FakeEvent("第一句")
+        plugin.state.in_flight[first.unified_msg_origin] = first  # noqa: SLF001
+        second = FakeEvent("第二句")
+        plugin._interrupt_in_flight(first.unified_msg_origin, second)  # noqa: SLF001
+        return first, second, plugin
+
+    first, second, plugin = run(scenario())
+    assert first.get_extra("betterchat_stale") is True
+    assert second.get_extra("betterchat_stale") is None
+    # 确实发出了停止请求，且排除了新事件。
+    assert loaded and plugin is not None
+
+
+def test_stale_event_is_blocked_at_llm_and_result(loaded) -> None:
+    async def scenario():
+        plugin = loaded.module.BetterChatPlugin(
+            context=None, config=FakeConfig(base_config())
+        )
+        event = FakeEvent("旧回复")
+        event.set_extra("betterchat_stale", True)
+        event._result = types.SimpleNamespace(chain=[_Plain("旧回复")])  # noqa: SLF001
+        await plugin.on_llm_request(event, None)
+        blocked_llm = event.is_stopped()
+
+        event2 = FakeEvent("旧回复")
+        event2.set_extra("betterchat_stale", True)
+        event2._result = types.SimpleNamespace(chain=[_Plain("旧回复")])  # noqa: SLF001
+        await plugin.on_decorating_result(event2)
+        return blocked_llm, event2
+
+    blocked_llm, event2 = run(scenario())
+    assert blocked_llm is True
+    # 关键：chain 被清空，保证一个字都发不出去。
+    assert event2.get_result().chain == []
+    assert event2.is_stopped() is True
+
+
+def test_non_stale_result_is_untouched(loaded) -> None:
+    async def scenario():
+        plugin = loaded.module.BetterChatPlugin(
+            context=None, config=FakeConfig(base_config())
+        )
+        event = FakeEvent("正常回复")
+        event._result = types.SimpleNamespace(chain=[_Plain("正常回复")])  # noqa: SLF001
+        await plugin.on_decorating_result(event)
+        return event
+
+    event = run(scenario())
+    assert len(event.get_result().chain) == 1
+    assert event.is_stopped() is False
+
+
+def test_second_private_message_interrupts_the_first(loaded) -> None:
+    """回归测试：第二条私聊消息必须真的能打断第一条。
+
+    这里曾经有个 bug —— ``in_flight`` 在合并逻辑**之前**就被设成了当前
+    事件，于是「打断旧事件」的检查永远读到自己，私聊打断完全失效。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.15,
+            "min_quiet_seconds": 0.15,
+            "max_quiet_seconds": 0.15,
+            "total_seconds": 0.4,
+        }
+        plugin = loaded.module.BetterChatPlugin(context=None, config=config)
+
+        first = FakeEvent("第一句话")
+        first_task = asyncio.create_task(plugin.on_waiting_llm(first))
+        await asyncio.sleep(0.02)  # 让 first 进入等待并登记 in_flight
+
+        # first 应当已被登记为「在跑的那条」。
+        assert plugin.state.in_flight.get(first.unified_msg_origin) is first
+
+        second = FakeEvent("第二句话")
+        # 打断发生在第二条进入窗口之前。
+        await plugin.on_waiting_llm(second)
+
+        await asyncio.wait_for(first_task, timeout=2.0)
+
+        # 第一条被标记为失效 -> 它一个字都不会发出去。
+        assert first.get_extra("betterchat_stale") is True
+        # 第二条拿到本轮 -> 交还原生流程。
+        assert second.call_llm is False
+        # 第二条成为新的在跑事件。
+        assert plugin.state.in_flight.get(second.unified_msg_origin) is second
+        return True
+
+    assert run(scenario()) is True
+
+
+def test_superseded_message_does_not_run_llm(loaded) -> None:
+    """被接管的那条必须禁止默认 LLM，否则会重复回复。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.2,
+            "min_quiet_seconds": 0.2,
+            "max_quiet_seconds": 0.2,
+            "total_seconds": 0.5,
+        }
+        plugin = loaded.module.BetterChatPlugin(context=None, config=config)
+
+        first = FakeEvent("第一句")
+        task = asyncio.create_task(plugin.on_waiting_llm(first))
+        await asyncio.sleep(0.02)
+
+        second = FakeEvent("第二句")
+        plugin.merge.reserve(second.unified_msg_origin, "第二句")
+        await asyncio.wait_for(task, timeout=2.0)
+        return first
+
+    first = run(scenario())
+    assert first.call_llm is True  # True == 禁止默认 LLM
+
+
+def test_group_gate_records_reply_for_rate_limiting(loaded) -> None:
+    """回归测试：判定要回复时必须记账。
+
+    ``max_replies_per_hour`` 读的就是这个计数；如果回复后不累加，
+    限频永远读到 0，等于完全没限频。
+    """
+
+    async def scenario():
+        import tempfile
+
+        # 每个实例用独立的状态文件，避免测试之间互相污染。
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin = loaded.module.BetterChatPlugin(
+                context=None, config=FakeConfig(base_config())
+            )
+            plugin.limiter = loaded.module.RateLimiter(
+                pathlib.Path(tmp) / "state.json"
+            )
+            umo = "test:group:1"
+
+            # 直接驱动判定结果，绕开真实 Jev 调用。
+            from betterchat_core import Action, GroupVerdict
+
+            async def fake_judge(*_a, **_k):
+                return GroupVerdict(Action.RESPOND, "test")
+
+            plugin._judge_group = fake_judge  # noqa: SLF001
+            event = FakeEvent("这是一个会被主动插话的群消息", group=True)
+            await plugin.on_group_message(event)
+
+            # 记账是异步落盘的，等它跑完。
+            for _ in range(20):
+                if plugin.limiter.count(umo) > 0:
+                    break
+                await asyncio.sleep(0.01)
+            return plugin.limiter.count(umo)
+
+    assert run(scenario()) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 生命周期
+# --------------------------------------------------------------------------- #
+
+
+def test_terminate_is_idempotent_and_safe(loaded) -> None:
+    async def scenario():
+        plugin = loaded.module.BetterChatPlugin(
+            context=None, config=FakeConfig(base_config())
+        )
+        await plugin.terminate()
+        await plugin.terminate()
+        return True
+
+    assert run(scenario()) is True
+
+
+def test_terminate_wakes_waiting_merges(loaded) -> None:
+    """热重载时正在等待的合并必须被唤醒，不能留孤儿任务。"""
+
+    async def scenario():
+        plugin = loaded.module.BetterChatPlugin(
+            context=None, config=FakeConfig(base_config())
+        )
+        reservation = plugin.merge.reserve("umo", "hi")
+        task = asyncio.create_task(plugin.merge.wait_for_quiet("umo", reservation))
+        await asyncio.sleep(0)
+        await plugin.terminate()
+        return await asyncio.wait_for(task, timeout=2.0)
+
+    assert run(scenario()) is not None

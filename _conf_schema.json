@@ -1,0 +1,266 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用 BetterChat",
+    "hint": "总开关。关闭后本插件完全不介入，AstrBot 恢复原生行为。",
+    "default": true
+  },
+  "private": {
+    "type": "object",
+    "description": "私聊合并",
+    "hint": "用户连续打字时先不回复，等静默窗口结束再把整串消息合并成一条输入交给模型。",
+    "items": {
+      "enable": {
+        "type": "bool",
+        "description": "启用私聊合并",
+        "hint": "关闭后私聊恢复原生：每收到一条消息就立刻回复。",
+        "default": true
+      },
+      "base_quiet_seconds": {
+        "type": "float",
+        "description": "静默窗口基准时长（秒）",
+        "hint": "从用户最后一条消息算起，安静这么久就认为他说完了。实际窗口会按文本长度在上限/下限之间浮动。",
+        "default": 2.0,
+        "slider": { "min": 0.5, "max": 10, "step": 0.5 }
+      },
+      "min_quiet_seconds": {
+        "type": "float",
+        "description": "静默窗口下限（秒）",
+        "hint": "无论文本多短，窗口至少这么长。防止用户刚发两个字就被抢答。",
+        "default": 1.5,
+        "slider": { "min": 0.5, "max": 10, "step": 0.5 }
+      },
+      "max_quiet_seconds": {
+        "type": "float",
+        "description": "静默窗口上限（秒）",
+        "hint": "文本很长时窗口最多延长到这里，不会无限等下去。必须大于等于下限。",
+        "default": 4.0,
+        "slider": { "min": 1, "max": 20, "step": 0.5 }
+      },
+      "total_seconds": {
+        "type": "float",
+        "description": "整轮硬上限（秒）",
+        "hint": "从这轮第一条消息算起，最多等这么久就强制回复。防止用户一直打字导致 Bot 永远不开口。",
+        "default": 8.0,
+        "slider": { "min": 2, "max": 60, "step": 1 }
+      },
+      "length_scale_chars": {
+        "type": "int",
+        "description": "长度换算（每 N 字 +1 秒）",
+        "hint": "文本越长，说明话说得越多，窗口相应延长。设为 0 则完全不按长度浮动。",
+        "default": 60,
+        "slider": { "min": 0, "max": 300, "step": 10 }
+      },
+      "max_messages": {
+        "type": "int",
+        "description": "单轮最多合并条数",
+        "hint": "超过这个条数时不再继续等待，立即开启新一轮回复。0 表示不限制。",
+        "default": 8,
+        "slider": { "min": 0, "max": 50, "step": 1 }
+      },
+      "max_chars": {
+        "type": "int",
+        "description": "单轮最多合并字数",
+        "hint": "超过这个字数时立即开始回复。0 表示不限制。宁可多回一条，也不丢消息。",
+        "default": 4000,
+        "slider": { "min": 0, "max": 20000, "step": 100 }
+      },
+      "ignore_prefixes": {
+        "type": "list",
+        "description": "不参与合并的前缀",
+        "hint": "以这些符号开头的消息（例如指令）会跳过合并，立刻交给 AstrBot 原生处理。",
+        "default": ["/", "!"]
+      }
+    }
+  },
+  "interrupt": {
+    "type": "object",
+    "description": "打断生成",
+    "hint": "私聊 Bot 正在生成回复时用户又发来新消息，是否立刻停止生成、丢弃这条旧回复，只回答新消息。",
+    "items": {
+      "enable": {
+        "type": "bool",
+        "description": "启用打断",
+        "hint": "关闭后新消息会等旧回复说完再排队回答（AstrBot 原生行为）。",
+        "default": true
+      },
+      "mode": {
+        "type": "string",
+        "description": "打断方式",
+        "hint": "优雅停止：保留已经生成的半截内容并正常写入会话历史，但不会发给用户。关闭：完全不打断。",
+        "default": "graceful",
+        "options": ["graceful", "none"],
+        "labels": ["优雅停止", "关闭打断"],
+        "subtitles": [
+          "推荐。立刻中止生成，丢弃旧回复，只回答新消息",
+          "不打断，新消息排队等旧回复说完"
+        ]
+      }
+    }
+  },
+  "group": {
+    "type": "object",
+    "description": "群聊 Jev 闸门",
+    "hint": "群消息先过本地闸门，再交给 Jev 判断要不要回复。判定要回复时，即使没有 @ Bot 也会主动插话。",
+    "items": {
+      "enable": {
+        "type": "bool",
+        "description": "启用群聊闸门",
+        "hint": "关闭后群聊恢复原生：只有被 @ / 引用 / 唤醒词才回复。",
+        "default": true
+      },
+      "judge_all_messages": {
+        "type": "bool",
+        "description": "判定所有群消息（允许主动插话）",
+        "hint": "开启：不 @ 也可能被回复。关闭：只判定被 @ / 引用 / 唤醒词的消息，Jev 仅用来过滤「叫了但没必要回」的情况。",
+        "default": true
+      },
+      "min_message_length": {
+        "type": "int",
+        "description": "最短判定长度（字符）",
+        "hint": "短于这个长度的消息不送 Jev，直接跳过。省额度也避免对「哈哈」「在」过度反应。",
+        "default": 6,
+        "slider": { "min": 0, "max": 100, "step": 1 }
+      },
+      "max_replies_per_hour": {
+        "type": "int",
+        "description": "每群每小时最多主动回复次数",
+        "hint": "本地计数，不占 Jev 额度。0 表示不限制。",
+        "default": 8,
+        "slider": { "min": 0, "max": 60, "step": 1 }
+      },
+      "min_interval_seconds": {
+        "type": "int",
+        "description": "两次主动回复的最小间隔（秒）",
+        "hint": "防止连续插话刷屏。0 表示不限制。",
+        "default": 120,
+        "slider": { "min": 0, "max": 3600, "step": 10 }
+      },
+      "bot_cooldown_seconds": {
+        "type": "int",
+        "description": "Bot 发言后冷却（秒）",
+        "hint": "Bot 刚说完话的一段时间内不再主动插话，避免自说自话。",
+        "default": 90,
+        "slider": { "min": 0, "max": 3600, "step": 10 }
+      },
+      "context_messages": {
+        "type": "int",
+        "description": "带给 Jev 的群消息条数",
+        "hint": "把最近这么多条群消息作为上下文一起判定，判断更准。0 表示只发当前这条。",
+        "default": 10,
+        "slider": { "min": 0, "max": 30, "step": 1 }
+      },
+      "fail_policy": {
+        "type": "string",
+        "description": "Jev 失败时的策略",
+        "hint": "Jev 超时、报错或返回不合法时的兜底行为。这里的「失败」不包括被本地闸门拦下的情况。",
+        "default": "closed",
+        "options": ["closed", "open"],
+        "labels": ["不回复（保守）", "放行（交给原生流程）"],
+        "subtitles": [
+          "推荐。判定不了就不插话，退回「只有被 @ 才回」",
+          "判定不了时照常走原生流程，群聊里通常等于不回复"
+        ]
+      }
+    }
+  },
+  "jev": {
+    "type": "object",
+    "description": "Jev 渠道",
+    "hint": "Jev 是 TypeSafe 的结构化判定模型（不是聊天模型），专门回答「要不要回复」这类是非问题。支持官方与 Cloudflare 两个渠道。",
+    "items": {
+      "channel": {
+        "type": "string",
+        "description": "渠道",
+        "hint": "两个渠道价格相同，但模型版本可能不同步。切换后请查看日志确认实际生效的 endpoint 与模型版本。",
+        "default": "official",
+        "options": ["official", "cloudflare"],
+        "labels": ["TypeSafe 官方", "Cloudflare Workers AI"],
+        "subtitles": [
+          "直连 api.typesafe.ai，默认 jev-latest",
+          "经 Cloudflare 转发，需要账号 ID 与 API Token"
+        ]
+      },
+      "api_key": {
+        "type": "string",
+        "description": "TypeSafe API Key",
+        "hint": "官方渠道使用。留空则群聊闸门自动禁用，私聊合并仍正常工作。",
+        "default": "",
+        "secret": true
+      },
+      "api_base": {
+        "type": "string",
+        "description": "官方 API 地址",
+        "hint": "一般不需要改。填入反代地址时请包含 https://；非本机的 http:// 会被强制升级为 https。",
+        "default": "https://api.typesafe.ai"
+      },
+      "model": {
+        "type": "string",
+        "description": "官方渠道模型",
+        "hint": "可填 jev-latest 或具体版本号（如 jev-1.14.0）。需要两端行为一致时建议显式固定版本。",
+        "default": "jev-latest"
+      },
+      "cf_account_id": {
+        "type": "string",
+        "description": "Cloudflare 账号 ID",
+        "hint": "Cloudflare 渠道使用。在 Cloudflare 控制台账号主页右侧可找到。",
+        "default": ""
+      },
+      "cf_api_token": {
+        "type": "string",
+        "description": "Cloudflare API Token",
+        "hint": "Cloudflare 渠道使用。需要有 Workers AI 调用权限。",
+        "default": "",
+        "secret": true
+      },
+      "cf_model": {
+        "type": "string",
+        "description": "Cloudflare 渠道模型",
+        "hint": "默认 typesafe/jev。Cloudflare 也会单独提供带版本号的模型，可按需替换。",
+        "default": "typesafe/jev"
+      },
+      "timeout_seconds": {
+        "type": "float",
+        "description": "单次判定超时（秒）",
+        "hint": "Jev 单次请求的硬截止时间。超时会按「失败策略」处理，不会阻塞消息流程。",
+        "default": 3.0,
+        "slider": { "min": 0.5, "max": 15, "step": 0.5 }
+      },
+      "max_concurrency": {
+        "type": "int",
+        "description": "最大并发判定数",
+        "hint": "同时进行的 Jev 请求上限，防止群里刷屏时打爆额度或本地连接数。",
+        "default": 4,
+        "slider": { "min": 1, "max": 16, "step": 1 }
+      },
+      "breaker_failures": {
+        "type": "int",
+        "description": "熔断前连续失败次数",
+        "hint": "连续失败达到这个次数后暂停请求一段时间，避免持续无效调用拖慢群消息处理。",
+        "default": 3,
+        "slider": { "min": 1, "max": 10, "step": 1 }
+      },
+      "breaker_open_seconds": {
+        "type": "int",
+        "description": "熔断持续时间（秒）",
+        "hint": "熔断期间完全不发请求，全部按「失败策略」处理。",
+        "default": 60,
+        "slider": { "min": 10, "max": 600, "step": 10 }
+      },
+      "reply_threshold": {
+        "type": "float",
+        "description": "判定「该回复」的阈值",
+        "hint": "Jev 返回的是 0~1 的概率。调高更保守（少插话），调低更主动（多插话）。",
+        "default": 0.7,
+        "slider": { "min": 0.3, "max": 1, "step": 0.05 }
+      },
+      "already_answered_threshold": {
+        "type": "float",
+        "description": "「已被回答」判定的阈值",
+        "hint": "当 Jev 认为这个话题 Bot 刚刚已经答过时，超过这个值就不再重复回复。",
+        "default": 0.7,
+        "slider": { "min": 0.3, "max": 1, "step": 0.05 }
+      }
+    }
+  }
+}

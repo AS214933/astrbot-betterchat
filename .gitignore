@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 测试 / 工具
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 本地运行产物（AstrBot 运行期数据不应进仓库）
+data/
+*.log
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 虚拟环境
+.venv/
+venv/
+env/

@@ -152,6 +152,17 @@
         "hint": "开启：不 @ 也可能被回复。关闭：只判定被 @ / 引用 / 唤醒词的消息，Jev 仅用来过滤「叫了但没必要回」的情况。",
         "default": true
       },
+      "aggregate_window_seconds": {
+        "type": "float",
+        "description": "判定前聚合窗口（秒）",
+        "hint": "群消息到达后先安静这么久，期间同一个人连发的多条会合并成一次 Jev 判定 —— 群里连刷三句只花一次调用，判断也更准。设为 0 则每条消息各判一次（同类插件的做法）。被 @ / 引用的消息不受此窗口影响，永远立即判定。",
+        "default": 1.5,
+        "slider": {
+          "min": 0,
+          "max": 5,
+          "step": 0.1
+        }
+      },
       "min_message_length": {
         "type": "int",
         "description": "最短判定长度（字符）",

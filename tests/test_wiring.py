@@ -282,6 +282,20 @@ def loaded():
         sys.path.remove(str(root))
 
 
+def _isolated_plugin(loaded, config):  # noqa: ANN001
+    """建一个插件实例，并把限频状态文件放到临时目录。
+
+    限频计数是**跨实例持久化**的（这是产品特性），所以测试之间会互相污染 ——
+    前一个测试记的回复会让后一个测试被判 RATE_LIMITED。
+    """
+    import tempfile
+
+    tmp = tempfile.mkdtemp()
+    plugin = loaded.module.BetterChatPlugin(context=None, config=config)
+    plugin.limiter = loaded.module.RateLimiter(pathlib.Path(tmp) / "state.json")
+    return plugin
+
+
 def base_config() -> dict:
     return {
         "enabled": True,
@@ -685,6 +699,112 @@ def test_jev_failure_logs_again_when_error_changes(loaded) -> None:
 
     warnings = run(scenario())
     assert len(warnings) == 2
+
+
+def test_group_aggregation_merges_burst_into_one_judge(loaded) -> None:
+    """群聊连刷多条 → 只调用一次 Jev 判定。
+
+    被并进来的事件必须**禁止默认 LLM**，否则会重复回复。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {
+            "enable": True,
+            "judge_all_messages": True,
+            "aggregate_window_seconds": 0.08,
+            "min_message_length": 1,
+        }
+        plugin = _isolated_plugin(loaded, config)
+
+        calls = {"n": 0}
+
+        from betterchat_core import Action, GroupVerdict
+
+        async def fake_judge(event, umo, settings, text, already_woken):
+            calls["n"] += 1
+            calls["text"] = text
+            return GroupVerdict(Action.IGNORE, "test")
+
+        plugin._judge_group = fake_judge  # noqa: SLF001
+
+        # 连发三条
+        events = [FakeEvent(f"第{i}句话都挺长的", group=True) for i in range(3)]
+        tasks = [
+            asyncio.create_task(plugin.on_group_message(e)) for e in events
+        ]
+        await asyncio.sleep(0.01)
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        return calls, events
+
+    calls, events = run(scenario())
+    # 三次消息只产生一次判定。
+    assert calls["n"] == 1, f"应只判定一次，实际 {calls['n']} 次"
+    # 判定用的文本包含三句。
+    assert "第0句" in calls["text"] and "第2句" in calls["text"]
+    # 被并进来的事件都不许跑默认 LLM。
+    for offset, event in enumerate(events):
+        assert event.call_llm is True, f"第{offset}条不应触发默认 LLM"
+
+
+def test_group_aggregation_skipped_when_woken(loaded) -> None:
+    """被 @ 的消息不聚合，必须立即判定。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {
+            "enable": True,
+            "judge_all_messages": True,
+            "aggregate_window_seconds": 5.0,  # 很长，若聚合会卡住
+            "min_message_length": 1,
+        }
+        plugin = _isolated_plugin(loaded, config)
+        # 被唤醒的消息不受主动插话限频约束，这里也不该被历史计数干扰。
+
+        from betterchat_core import Action, GroupVerdict
+
+        async def fake_judge(*_a, **_k):
+            return GroupVerdict(Action.RESPOND, "woken")
+
+        plugin._judge_group = fake_judge  # noqa: SLF001
+
+        event = FakeEvent("HexVergeBot 帮我看下", group=True)
+        event.is_at_or_wake_command = True
+        await asyncio.wait_for(plugin.on_group_message(event), timeout=2.0)
+        return event
+
+    event = run(scenario())
+    # 立即判定并放行，不该等 5 秒。
+    assert event.call_llm is False
+
+
+def test_group_aggregation_disabled_when_zero(loaded) -> None:
+    """窗口设 0 → 恢复每条各判一次。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {
+            "enable": True,
+            "judge_all_messages": True,
+            "aggregate_window_seconds": 0,
+            "min_message_length": 1,
+        }
+        plugin = _isolated_plugin(loaded, config)
+
+        calls = {"n": 0}
+        from betterchat_core import Action, GroupVerdict
+
+        async def fake_judge(*_a, **_k):
+            calls["n"] += 1
+            return GroupVerdict(Action.IGNORE, "test")
+
+        plugin._judge_group = fake_judge  # noqa: SLF001
+        for i in range(3):
+            await plugin.on_group_message(FakeEvent(f"第{i}句话都挺长的", group=True))
+        return calls["n"]
+
+    assert run(scenario()) == 3
 
 
 # --------------------------------------------------------------------------- #

@@ -24,6 +24,7 @@ from typing import Callable, Iterable, Sequence
 __all__ = [
     "Action",
     "ChatLine",
+    "GroupAggregator",
     "GateDecision",
     "GateReason",
     "GroupSettings",
@@ -35,6 +36,7 @@ __all__ = [
     "build_gate_state",
     "decide_group_action",
     "gate_reason",
+    "merge_group_lines",
     "merge_texts",
     "quiet_seconds_for",
     "resolve_fail_policy",
@@ -388,6 +390,176 @@ class MergeWindow:
             return merged, turn.count
 
 
+class GroupAggregator:
+    """群聊「判定前」的短暂聚合窗口。
+
+    对比过几种做法后选定的形态：
+
+    * 现有三家同类插件（reply_gate / jev_router / czyczy23）**都是每条群消息
+      判一次**，没有一家在判定前聚合。所以我们这里比它们更省调用。
+    * czyczy23 虽然有「等待窗口」，但那个窗口是在**决定回复之后**才开的，
+      用于攒更多消息一次性回复，判定本身早就做完了；而且是 100ms 轮询，
+      既费 CPU 精度又差。我们不复用那种做法。
+
+    我们的窗口开在**判定之前**：群里连刷三句只花一次 Jev 调用，而且
+    ``open_question`` 看的是合并后的完整语义，不是被打断的半句。
+
+    复用 :class:`MergeWindow` 已经验证过的核心机制（同步 ``reserve`` 保证
+    原子性、ticket 仲裁、``asyncio.Event`` 等待而非轮询），区别是攒的是
+    :class:`ChatLine` 而不是纯字符串 —— 发送者、是否 Bot 自己、是否 @ Bot
+    这些信息在群聊判定里都要保留。
+    """
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._turns: dict[str, _GroupTurn] = {}
+        self._settled: dict[str, int] = {}
+        self._next_ticket = 0
+        self._lock = asyncio.Lock()
+        self._closed = False
+
+    async def close(self) -> None:
+        """唤醒所有等待者，避免热重载时留下孤儿任务。"""
+        self._closed = True
+        for turn in list(self._turns.values()):
+            turn.wake.set()
+        self._turns.clear()
+
+    def reserve(
+        self, group_key: str, line: ChatLine, *, window_seconds: float
+    ) -> Reservation:
+        """同步登记一条群消息，返回它在本轮中的位置。
+
+        值 **不能** 返回"是否并入了已有窗口"：并发到达时，先登记的那条
+        也可能被后来的顶掉（``SUPERSEDED``），而后来者又都"并入"了自己
+        提前返回 —— 结果没有人负责结算，判定直接丢失。所以统一让所有
+        到达者都去 :meth:`wait`，由最终仍是 owner 的那条收口。
+
+        关键：**这个函数内部不能有 ``await``**。多事件并发进入时，只有同步
+        登记才能保证 ticket 顺序等于到达顺序。
+        """
+        self._prune()
+        self._next_ticket += 1
+        now = self._clock()
+        reservation = Reservation(
+            ticket=self._next_ticket, received_at=now, text=line.text
+        )
+
+        turn = self._turns.get(group_key)
+        if turn is None:
+            turn = _GroupTurn(created_at=now)
+            self._turns[group_key] = turn
+
+        turn.owner_ticket = reservation.ticket
+        turn.latest_at = now
+        turn.window_seconds = max(0.0, window_seconds)
+        turn.lines.append(line)
+        turn.version += 1
+        turn.wake.set()
+        turn.wake = asyncio.Event()
+        return reservation
+
+    def _prune(self) -> None:
+        if not self._turns:
+            return
+        now = self._clock()
+        horizon = 120.0
+        for key in [k for k, v in self._turns.items() if now - v.latest_at > horizon]:
+            self._turns.pop(key, None)
+            self._settled.pop(key, None)
+
+    async def wait(
+        self, group_key: str, reservation: Reservation
+    ) -> ReservationState:
+        """等到窗口关闭。
+
+        只有**最新的那条**消息有资格收口；更早的已经被并进来，
+        应当直接退出（它们的文本已经在合并结果里）。
+        """
+        while True:
+            if self._closed:
+                return ReservationState.BYPASS
+            turn = self._turns.get(group_key)
+            if turn is None:
+                if self._settled.get(group_key, 0) >= reservation.ticket:
+                    return ReservationState.SUPERSEDED
+                return ReservationState.BYPASS
+            # 窗口被更新的消息接管：我不是最新的，让最新的那条负责。
+            if turn.owner_ticket != reservation.ticket:
+                return ReservationState.SUPERSEDED
+            timeout = turn.latest_at + turn.window_seconds - self._clock()
+            if timeout <= 0:
+                return ReservationState.OWNER
+            version, wake = turn.version, turn.wake
+            wake.clear()
+            if turn.version != version:
+                continue
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=timeout)
+            except (asyncio.TimeoutError, TimeoutError):
+                # 窗口到期。再确认一次归属，然后收口。
+                latest = self._turns.get(group_key)
+                if latest is None:
+                    if self._settled.get(group_key, 0) >= reservation.ticket:
+                        return ReservationState.SUPERSEDED
+                    return ReservationState.BYPASS
+                if latest.owner_ticket != reservation.ticket:
+                    return ReservationState.SUPERSEDED
+                return ReservationState.OWNER
+
+    async def settle(
+        self, group_key: str, reservation: Reservation
+    ) -> list[ChatLine] | None:
+        """关闭窗口并取走这一批消息（按到达顺序）。"""
+        async with self._lock:
+            turn = self._turns.get(group_key)
+            if turn is None or turn.owner_ticket != reservation.ticket:
+                return None
+            self._turns.pop(group_key, None)
+            self._settled[group_key] = reservation.ticket
+            return list(turn.lines)
+
+
+@dataclass
+class _GroupTurn:
+    """一群正在聚合中的消息。"""
+
+    created_at: float
+    owner_ticket: int = 0
+    latest_at: float = 0.0
+    window_seconds: float = 0.0
+    lines: list[ChatLine] = field(default_factory=list)
+    version: int = 0
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+def merge_group_lines(lines: Sequence[ChatLine]) -> ChatLine:
+    """把一批聚合到的消息合成一条"最新消息"。
+
+    规则刻意保守：
+
+    * 只有**同一个人**连发的才算同一句话，直接换行拼接。
+    * 混了不同的人，就不硬拼成一条 —— 那样会让 Jev 以为是一句话，
+      反而降低判断质量。此时保留最后一条作为主体，其余作为上下文。
+    """
+    if not lines:
+        return ChatLine(sender="", text="")
+    if len(lines) == 1:
+        return lines[0]
+    senders = {line.sender for line in lines}
+    last = lines[-1]
+    if len(senders) == 1:
+        merged_text = "\n".join(line.text for line in lines if line.text)
+        return ChatLine(
+            sender=last.sender,
+            text=merged_text,
+            is_self=any(line.is_self for line in lines),
+            at_bot=any(line.at_bot for line in lines),
+            seconds_ago=last.seconds_ago,
+        )
+    return last
+
+
 # --------------------------------------------------------------------------- #
 # 群聊闸门
 # --------------------------------------------------------------------------- #
@@ -416,6 +588,8 @@ class GroupSettings:
     min_interval_seconds: int = 120
     bot_cooldown_seconds: int = 90
     context_messages: int = 10
+    aggregate_window_seconds: float = 1.5
+    """判定前的静默聚合窗口（秒）。0 表示每条消息各判一次。"""
     fail_policy: str = "closed"
 
     @classmethod
@@ -438,6 +612,9 @@ class GroupSettings:
                 0, _as_int(section.get("bot_cooldown_seconds", 90), 90)
             ),
             context_messages=max(0, _as_int(section.get("context_messages", 10), 10)),
+            aggregate_window_seconds=max(
+                0.0, min(10.0, _as_float(section.get("aggregate_window_seconds", 1.5), 1.5))
+            ),
             fail_policy=policy,
         )
 

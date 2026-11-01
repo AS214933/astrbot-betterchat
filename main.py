@@ -26,6 +26,7 @@ try:  # 包内导入（AstrBot 正常加载方式）
     from .betterchat_core import (
         Action,
         ChatLine,
+        GroupAggregator,
         GroupSettings,
         GroupVerdict,
         MergeSettings,
@@ -34,6 +35,7 @@ try:  # 包内导入（AstrBot 正常加载方式）
         build_gate_state,
         decide_group_action,
         gate_reason,
+        merge_group_lines,
         resolve_fail_policy,
     )
     from .betterchat_jev import (
@@ -47,6 +49,7 @@ except ImportError:  # 直接以路径加载时的兜底
     from betterchat_core import (
         Action,
         ChatLine,
+        GroupAggregator,
         GroupSettings,
         GroupVerdict,
         MergeSettings,
@@ -55,6 +58,7 @@ except ImportError:  # 直接以路径加载时的兜底
         build_gate_state,
         decide_group_action,
         gate_reason,
+        merge_group_lines,
         resolve_fail_policy,
     )
     from betterchat_jev import JevClient, JevConfig, JevError, build_group_questions
@@ -99,6 +103,7 @@ class BetterChatPlugin(Star):
         # 注意：面板每次保存配置都会重建本对象，所以 __init__ 里
         # 绝不能做网络请求或阻塞操作。
         self.merge = MergeWindow(settings=self._merge_settings())
+        self.group_agg = GroupAggregator()
         self.state = RuntimeState()
         self.limiter = RateLimiter(_plugin_data_dir() / "state.json")
         self.jev = JevClient(self._jev_config())
@@ -107,6 +112,8 @@ class BetterChatPlugin(Star):
         self._last_jev_error: str | None = None
         self._last_jev_error_at: float = 0.0
         self._jev_error_cooldown: float = 300.0
+        #: 聚合时收集到的其他消息，送去判定后即清空。
+        self._pending_group_context: dict[str, list] = {}
 
         self._log_startup()
 
@@ -465,6 +472,21 @@ class BetterChatPlugin(Star):
             event.is_at_or_wake_command = False
             return
 
+        # ---- 判定前聚合 ----
+        # 被 @ / 引用的消息不聚合：用户明确叫了 Bot，必须立刻响应。
+        # 只有「未唤醒的主动插话」才值得攒一下 —— 群里连刷三句只花一次调用，
+        # 而且 open_question 看的是合并后的完整语义，不是被打断的半句。
+        window = 0.0 if already_woken else settings.aggregate_window_seconds
+        if window > 0:
+            state = await self._aggregate_group(event, umo, settings, window, text)
+            if state is None:
+                return
+            text, merged_count = state
+            if merged_count > 1:
+                logger.info(
+                    f"[BetterChat] 聚合 {merged_count} 条群消息为一次判定"
+                )
+
         verdict = await self._judge_group(event, umo, settings, text, already_woken)
         event.set_extra(EXTRA_GROUP_VERDICT, verdict)
 
@@ -493,6 +515,47 @@ class BetterChatPlugin(Star):
             f" addressed={verdict.addressed} question={verdict.open_question}"
             f" answered={verdict.already_answered}"
         )
+
+    async def _aggregate_group(
+        self,
+        event: AstrMessageEvent,
+        umo: str,
+        settings: GroupSettings,
+        window: float,
+        text: str,
+    ) -> tuple[str, int] | None:
+        """决定本轮判定用哪段文本。
+
+        Returns:
+            ``(用于判定的文本, 合并条数)``；``None`` 表示**本事件不该继续**，
+            调用方应当直接返回（它已经被并进另一条消息的判定里）。
+        """
+        line = ChatLine(
+            sender=self._sender_name(event),
+            text=text,
+            is_self=False,
+            at_bot=bool(getattr(event, "is_at_or_wake_command", False)),
+            seconds_ago=self._seconds_since_created(event),
+        )
+        reservation = self.group_agg.reserve(umo, line, window_seconds=window)
+
+        # 所有到达者都进入等待，由最终仍是 owner 的那条收口。
+        # （不能因为"我并入了别的窗口"就提前返回 —— 并发下可能出现
+        #  先到者被顶掉、后到者都已退出，导致没有人负责判定。）
+        outcome = await self.group_agg.wait(umo, reservation)
+        if outcome is not ReservationState.OWNER:
+            self._take_over_turn(event)
+            event.is_at_or_wake_command = False
+            return None
+
+        batch = await self.group_agg.settle(umo, reservation)
+        if not batch:
+            return text, 1
+
+        latest = merge_group_lines(batch)
+        # 合并时其他人说的内容作为上下文一并送进去，判定更准。
+        self._pending_group_context[umo] = [b for b in batch[:-1] if b.text]
+        return latest.text or text, len(batch)
 
     def _log_jev_failure(self, exc: Exception) -> None:
         """Jev 失败时记日志，但同一条错误在冷却期内只记一次。
@@ -530,7 +593,7 @@ class BetterChatPlugin(Star):
             state = build_gate_state(
                 group_name=self._group_name(event),
                 latest=text,
-                context=self._recent_group_messages(event, settings.context_messages),
+                context=self._group_context(event, umo, settings),
                 bot_messages=self._recent_bot_messages(event),
                 **self._gate_state_extras(event, already_woken),
             )
@@ -668,6 +731,21 @@ class BetterChatPlugin(Star):
             return str(event.get_group_id() or "")
         except Exception:  # noqa: BLE001
             return ""
+
+    def _group_context(
+        self, event: AstrMessageEvent, umo: str, settings: GroupSettings
+    ) -> list:
+        """本次判定要带的上下文。
+
+        优先用聚合窗口里收集到的消息（它们是刚刚连续发生的，比历史
+        新鲜得多），取完后立即清空，避免下一条判定重复带上。
+        """
+        merged = self._pending_group_context.pop(umo, [])
+        history = self._recent_group_messages(event, settings.context_messages)
+        if not merged:
+            return history
+        # 聚合消息在前（更近），历史在后。
+        return list(merged) + list(history)[-max(0, settings.context_messages - len(merged)):]
 
     def _recent_group_messages(self, event: AstrMessageEvent, limit: int) -> list:
         """取最近的群消息作为判定上下文（结构化）。
@@ -899,6 +977,10 @@ class BetterChatPlugin(Star):
         面板每次保存配置都会走这里，所以必须干净：唤醒等待者、取消
         后台任务、关闭 HTTP 连接，且不能抛异常。
         """
+        try:
+            await self.group_agg.close()
+        except Exception:  # noqa: BLE001
+            logger.debug("[BetterChat] 关闭群聊聚合器失败", exc_info=True)
         try:
             await self.merge.close()
         except Exception:  # noqa: BLE001

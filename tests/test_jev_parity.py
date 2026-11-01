@@ -577,6 +577,101 @@ def test_payload_is_json_serializable() -> None:
     assert json.loads(body)["questions"] == questions
 
 
+def test_opencode_channel_uses_systemone_endpoint() -> None:
+    """OpenCode 渠道与官方同构：``{base}/systemone`` + 平铺 body。"""
+    config = JevConfig.from_config(
+        {"channel": "opencode", "oc_api_key": "k1", "oc_model": "jev-1.13"}
+    )
+    assert config.endpoint() == "https://opencode.ai/inference/systemone/v1/systemone"
+
+    async def scenario():
+        client = JevClient(config)
+        captured = install_fake_post(
+            client,
+            {"model": "jev-1.13", "answers": {"should_reply": {"type": "noul", "noul": 0.6}}},
+        )
+        await client.decide(state={"msg": "hi"}, questions=QUESTIONS)
+        return captured
+
+    captured = run(scenario())
+    assert captured.payload is not None
+    assert captured.payload["model"] == "jev-1.13"
+    # 与官方一样平铺，不套 input。
+    assert set(captured.payload) == {"model", "state", "questions"}
+
+
+def test_opencode_endpoint_accepts_full_path() -> None:
+    """用户把完整 endpoint 填进来时不要重复拼接。"""
+    config = JevConfig.from_config(
+        {
+            "channel": "opencode",
+            "oc_api_key": "k",
+            "oc_api_base": "https://opencode.ai/inference/systemone/v1/systemone",
+        }
+    )
+    assert config.endpoint().endswith("/v1/systemone")
+    assert not config.endpoint().endswith("/systemone/systemone")
+
+
+def test_opencode_requires_key_because_free_tier_is_walled() -> None:
+    """没有 key 就直接禁用。
+
+    OpenCode 的免费模型（``jev-1.13-free``）被服务端限制为只能在
+    OpenCode 客户端内使用，第三方调用一律 429 ``FreeUsageLimitError``。
+    与其每条群消息都撞一次 429，不如在配置阶段就明确禁用。
+    """
+    config = JevConfig.from_config({"channel": "opencode"})
+    missing = config.ready_missing()
+    assert missing is not None
+    assert "oc_api_key" in missing
+
+
+def test_opencode_free_usage_error_is_explained() -> None:
+    """429 FreeUsageLimitError 要给出可操作的解释，而不是原始 JSON。"""
+    from betterchat_jev import _explain_http_error
+
+    message = _explain_http_error(
+        status=429,
+        body=(
+            '{"type":"error","error":{"type":"FreeUsageLimitError","message":'
+            '"Free usage limit reached. Free models work in OpenCode"}}'
+        ),
+        channel="opencode",
+    )
+    assert "只能在 OpenCode" in message
+    # 必须指向真正可行的两条路。
+    assert "jev-1.13" in message
+    assert "TypeSafe 官方" in message
+
+
+def test_build_questions_have_no_hardcoded_version_dependency() -> None:
+    """问题定义不应绑定模型版本（jev-1.13 与 jev-latest 共用同一契约）。"""
+    from betterchat_jev import DEFAULT_MODEL, DEFAULT_OC_MODEL
+
+    assert DEFAULT_MODEL == "jev-latest"
+    assert DEFAULT_OC_MODEL == "jev-1.13"
+
+
+def test_active_model_reflects_channel() -> None:
+    """每个渠道报告自己的模型名，日志/诊断不能串台。"""
+    assert (
+        JevConfig.from_config({"channel": "official", "model": "jev-latest"}).active_model()
+        == "jev-latest"
+    )
+    assert (
+        JevConfig.from_config(
+            {"channel": "cloudflare", "cf_model": "typesafe/jev"}
+        ).active_model()
+        == "typesafe/jev"
+    )
+    assert (
+        JevConfig.from_config(
+            {"channel": "opencode", "oc_model": "jev-1.13"}
+        ).active_model()
+        == "jev-1.13"
+    )
+
+
 def test_question_payload_omits_absent_criteria() -> None:
     payload = NoulQuestion(instructions="x").to_payload()
     assert "criteria" not in payload

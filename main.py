@@ -155,7 +155,7 @@ class BetterChatPlugin(Star):
 
         logger.info(
             f"[BetterChat] Jev 渠道={jev.channel} endpoint={jev.endpoint()} "
-            f"model={jev.model if jev.channel == 'official' else jev.cf_model} "
+            f"model={jev.active_model()} "
             f"timeout={jev.timeout_seconds}s"
         )
         if jev.channel == "cloudflare":
@@ -813,7 +813,7 @@ class BetterChatPlugin(Star):
         lines.append("Jev")
         lines.append(f"  渠道：{jev.channel}")
         lines.append(f"  端点：{jev.endpoint()}")
-        lines.append(f"  模型：{jev.model if jev.channel == 'official' else jev.cf_model}")
+        lines.append(f"  模型：{jev.active_model()}")
         lines.append(f"  Key：{'已配置' if not missing else '未配置（闸门已禁用）'}")
         if missing:
             lines.append(f"  缺失：{missing}")

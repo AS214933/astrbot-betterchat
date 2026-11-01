@@ -162,29 +162,41 @@ Jev **没有 prompt / system 字段** —— 它只接受三样东西：
 拆开而不是问一个"该不该回复"，是因为后者把三个判断藏在一个数字背后 ——
 既没法单独调阈值，也看不出是哪一步否掉的。
 
-### 两个渠道
+### 三个渠道
 
-| | TypeSafe 官方 | Cloudflare Workers AI |
-|---|---|---|
-| 端点 | `POST api.typesafe.ai/v1/systemone` | `POST api.cloudflare.com/client/v4/accounts/{id}/ai/run` |
-| 模型位置 | 请求体的 `model` | 请求体的 `model`，参数包在 `input` 里 |
-| 响应 | `{model, answers, usage}` | 外面套一层 `{result, success, errors}` |
-| 需要 | API Key | 账号 ID + API Token |
+| | TypeSafe 官方 | Cloudflare Workers AI | OpenCode |
+|---|---|---|---|
+| 端点 | `api.typesafe.ai/v1/systemone` | `.../accounts/{id}/ai/run` | `opencode.ai/inference/systemone/v1/systemone` |
+| 请求形状 | `{model, state, questions}` | `{model, input:{state, questions}}` | `{model, state, questions}` |
+| 需要 | API Key | 账号 ID + Token | Console API Key |
+| 免费可用 | 按量计费（很便宜） | ❌ 免费额度不覆盖第三方模型 | ❌ 见下 |
 
-> ⚠️ **Cloudflare 的免费额度不覆盖第三方模型。**
-> Workers AI 每天送的 10,000 Neurons 只适用于 Cloudflare **自托管**的 `@cf/` 模型
-> （Llama、Qwen、Whisper 等）。`typesafe/jev` 属于第三方模型，走 AI Gateway
-> **统一计费**，需要先充值预付额度，否则会返回
-> `HTTP 402 / code 2021 Insufficient balance`。
->
-> 想零成本使用，请选 **TypeSafe 官方**渠道（Jev 本身按 $0.042/百万输入 token
-> 计费，输出免费，日常群聊基本花不到钱）。
+#### 关于 OpenCode 的"免费 jev" —— 用不了
 
-> 📌 **Cloudflare 的 URL 形状容易踩坑。** 第三方模型**不能**写成
-> `/ai/run/typesafe/jev`（会返回 `400 code 7000 No route for that URI`），
-> 也不能带 `@cf/` 前缀（会返回 `400 code 5007 No such model`）。
-> 正确写法是 `/ai/run` + 请求体 `{"model": "typesafe/jev", "input": {...}}`。
-> 本插件已按此实现；如果你手填了 `@cf/typesafe/jev`，会自动纠正。
+`jev-1.13-free` 确实存在，但**被服务端限制为只能在 OpenCode 客户端内使用**。实测：
+
+| 尝试 | 结果 |
+|---|---|
+| 直连 `jev-1.13-free` | `429 FreeUsageLimitError` |
+| 伪装成 OpenCode 的 User-Agent | 仍然 429（服务端按账号/网络判断，不是靠 UA） |
+| 直连付费 `jev-1.13` | `401` 需要 API Key ✅ |
+
+官方文档原话：*"Free-tier chat models require OpenCode; use paid models or **Go** from other clients."*
+
+#### 关于 OpenCode Go —— 也没有 Jev
+
+Go 订阅（$10/月）虽然允许第三方客户端调用，但**它的模型清单里没有 Jev**。实测：
+
+- 拉取 `opencode.ai/zen/v1/models`，78 个模型里**没有任何 jev**
+- 带 session 头打 Go 路由 → `Model is unavailable`
+- Go 页面列出的模型只有 Kimi / GLM / DeepSeek / MiMo / Claude Haiku 等编码模型
+
+所以**本插件不为 Go 提供单独渠道**——不是没做，是它确实没有这个模型。
+
+#### OpenCode 渠道的实际用途
+
+只能走付费 `jev-1.13` + Console API Key。适合已经在用 OpenCode、账户里已有余额的人。如果没有，**直接用 TypeSafe 官方渠道更省事**。
+
 
 ### 降级：任何失败都不影响可用性
 

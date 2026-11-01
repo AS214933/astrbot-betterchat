@@ -41,6 +41,22 @@ __all__ = [
 
 DEFAULT_OFFICIAL_BASE = "https://api.typesafe.ai"
 DEFAULT_CF_BASE = "https://api.cloudflare.com/client/v4/accounts"
+#: OpenCode 的 System One 端点。实测三个渠道的结论：
+#:
+#: * ``official``  —— ``POST {api_base}/v1/systemone``，最省心
+#: * ``cloudflare``—— ``POST .../ai/run``（第三方模型需预付额度）
+#: * ``opencode``  —— ``POST {oc_api_base}/systemone``，**需要付费 key**
+#:
+#: 关于 OpenCode 的免费/Go：
+#:
+#: * ``jev-1.13-free``：服务端限制为**只能在 OpenCode 客户端内**使用，
+#:   第三方程序调用一律 ``429 FreeUsageLimitError``，伪装 User-Agent 无效。
+#: * ``OpenCode Go`` 订阅：模型清单里**没有 Jev**（实测 78 个模型无一含 jev），
+#:   打 Go 路由会返回 ``Model is unavailable``，因此本插件不为 Go 提供单独渠道。
+#:
+#: 所以 OpenCode 渠道唯一可用的形态是：付费 ``jev-1.13`` + Console API Key。
+DEFAULT_OC_BASE = "https://opencode.ai/inference/systemone/v1"
+DEFAULT_OC_MODEL = "jev-1.13"
 DEFAULT_MODEL = "jev-latest"
 DEFAULT_CF_MODEL = "typesafe/jev"
 OFFICIAL_PATH = "/v1/systemone"
@@ -69,6 +85,9 @@ class JevConfig:
     cf_account_id: str = ""
     cf_api_token: str = ""
     cf_model: str = DEFAULT_CF_MODEL
+    oc_api_key: str = ""
+    oc_api_base: str = DEFAULT_OC_BASE
+    oc_model: str = DEFAULT_OC_MODEL
     timeout_seconds: float = 3.0
     max_concurrency: int = 4
     breaker_failures: int = 3
@@ -98,7 +117,7 @@ class JevConfig:
                 return default
 
         channel = text("channel", "official").lower()
-        if channel not in ("official", "cloudflare"):
+        if channel not in ("official", "cloudflare", "opencode"):
             channel = "official"
 
         cf_model = text("cf_model", DEFAULT_CF_MODEL) or DEFAULT_CF_MODEL
@@ -116,6 +135,9 @@ class JevConfig:
             cf_account_id=text("cf_account_id", ""),
             cf_api_token=text("cf_api_token", ""),
             cf_model=cf_model,
+            oc_api_key=text("oc_api_key", ""),
+            oc_api_base=text("oc_api_base", DEFAULT_OC_BASE) or DEFAULT_OC_BASE,
+            oc_model=text("oc_model", DEFAULT_OC_MODEL) or DEFAULT_OC_MODEL,
             timeout_seconds=max(0.1, number("timeout_seconds", 3.0)),
             max_concurrency=max(1, integer("max_concurrency", 4)),
             breaker_failures=max(1, integer("breaker_failures", 3)),
@@ -141,6 +163,12 @@ class JevConfig:
             if not self.cf_api_token:
                 missing.append("cf_api_token")
             return f"缺少配置: {', '.join(missing)}" if missing else None
+        if self.channel == "opencode":
+            if self.oc_api_key:
+                return None
+            # 免费模型无法从插件调用（服务端限制只在 OpenCode 客户端内可用），
+            # 因此没有 key 就没有任何可用路径，直接禁用比反复 429 体验好。
+            return "缺少配置: oc_api_key（OpenCode 的免费 jev 只能在 OpenCode 客户端内使用）"
         if not self.api_key:
             return "缺少配置: api_key"
         return None
@@ -163,14 +191,34 @@ class JevConfig:
             account = self.cf_account_id.strip()
             return f"{DEFAULT_CF_BASE}/{account}/ai/run"
 
+        if self.channel == "opencode":
+            # 官方 model 文件给出的 base_url 是
+            # https://opencode.ai/inference/systemone/v1，System One 路径是 /systemone。
+            base = self.oc_api_base.strip().rstrip("/")
+            if base.endswith("/systemone"):
+                return base
+            return base + "/systemone"
+
         base = self.api_base.strip().rstrip("/")
         # 允许用户把完整 endpoint 也填进来（例如反代到别的路径）。
         if base.endswith(OFFICIAL_PATH):
             return base
         return base + OFFICIAL_PATH
 
+    def active_model(self) -> str:
+        """当前渠道实际生效的模型名（用于日志与诊断输出）。"""
+        if self.channel == "cloudflare":
+            return self.cf_model
+        if self.channel == "opencode":
+            return self.oc_model
+        return self.model
+
     def auth_token(self) -> str:
-        return self.cf_api_token if self.channel == "cloudflare" else self.api_key
+        if self.channel == "cloudflare":
+            return self.cf_api_token
+        if self.channel == "opencode":
+            return self.oc_api_key
+        return self.api_key
 
 
 # --------------------------------------------------------------------------- #
@@ -348,6 +396,9 @@ class JevClient:
             # Cloudflare 的通用入口 /ai/run 需要把模型名放在请求体里，
             # 并把真正的参数包在 "input" 里（与官方渠道的裸 body 不同）。
             return {"model": self.config.cf_model, "input": body}
+        if self.config.channel == "opencode":
+            # OpenCode 的 System One 端点与官方同构：model 平铺在 body 里。
+            return {"model": self.config.oc_model, **body}
         # 官方：model 是 body 的必填字段，参数平铺。
         return {"model": self.config.model, **body}
 
@@ -501,6 +552,22 @@ def _explain_http_error(*, status: int, body: str, channel: str) -> str:
                 f"Cloudflare 找不到该模型（HTTP {status}）。"
                 "请确认 cf_model 填的是 typesafe/jev（不带 @cf/）。原始响应: "
                 f"{summary}"
+            )
+
+    if channel == "opencode":
+        # 429 FreeUsageLimitError：免费模型只能从 OpenCode 客户端内调用。
+        if "FreeUsageLimit" in body or "free tier" in body.lower():
+            return (
+                f"OpenCode 拒绝请求（HTTP {status}）。"
+                "免费模型（jev-1.13-free 等）被服务端限制为**只能在 OpenCode "
+                "客户端内**使用，第三方程序调用会直接返回 FreeUsageLimitError，"
+                "伪装 User-Agent 也无效。插件里请改填付费模型 jev-1.13 并配置 "
+                "OpenCode 的 API Key，或改用「TypeSafe 官方」渠道。原始响应: "
+                f"{summary}"
+            )
+        if "AuthError" in body or status == 401:
+            return (
+                f"OpenCode 认证失败（HTTP {status}），请检查 oc_api_key。原始响应: {summary}"
             )
 
     if status == 401:

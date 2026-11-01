@@ -20,11 +20,12 @@ import json
 import math
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-__all__ = ["RuntimeState", "RateLimiter"]
+__all__ = ["RuntimeState", "RateLimiter", "TranscriptCache"]
 
 
 def _wall_clock() -> float:
@@ -174,6 +175,72 @@ class RuntimeState:
                 stale.append(key)
         for key in stale:
             self.sessions.pop(key, None)
+
+
+class TranscriptCache:
+    """每个会话的最近消息缓存。
+
+    为什么必须自己存：AstrBot 的 ``AstrBotMessage`` 只有**当前这一条**消息
+    （``message`` / ``message_str`` / ``sender`` / ``timestamp``），并没有
+    "最近 N 条群消息"这种东西。插件要上下文只能自己记。
+
+    横向对比，``astrbot_plugin_reply_gate``、``czyczy23/astrbot_plugin_jev``
+    也都是这么做的（前者用 ``deque(maxlen=12)``，后者用
+    ``pending_messages_cache``）。唯一不同的是 ``jev_router``，它去读
+    AstrBot 的**对话历史**（conversations 表）—— 但那是"和 LLM 的对话记录"，
+    不是"群里的聊天流"，对判断"要不要插话"帮助有限。
+
+    刻意选了内存缓存而不是读数据库：
+    * 零 IO，判定路径上没有额外延迟
+    * 不依赖 AstrBot 内部表结构（升级不易碎）
+    * 群聊上下文本来就只需要"最近几条"
+    """
+
+    def __init__(self, *, maxlen: int = 20) -> None:
+        self.maxlen = max(2, int(maxlen))
+        self._cache: dict[str, deque[Any]] = {}
+
+    def record(self, key: str, line: Any) -> None:
+        """记一条消息。
+
+        同一个 ``message_id`` 不重复记 —— 群消息可能被多个 handler 看到
+        （AstrBot 的 handler 是链式执行的），不去重的话上下文里会出现重复条目，
+        反而干扰判定。
+        """
+        if line is None:
+            return
+        bucket = self._cache.get(key)
+        if bucket is None:
+            bucket = deque(maxlen=self.maxlen)
+            self._cache[key] = bucket
+        message_id = getattr(line, "message_id", "")
+        if message_id and bucket:
+            if getattr(bucket[-1], "message_id", "") == message_id:
+                return
+        bucket.append(line)
+
+    def recent(self, key: str, limit: int = 0) -> list[Any]:
+        """取最近 ``limit`` 条（``0`` 或负数表示不限，但不超过 maxlen）。"""
+        bucket = self._cache.get(key)
+        if not bucket:
+            return []
+        items = list(bucket)
+        if limit and limit > 0:
+            return items[-limit:]
+        return items
+
+    def clear(self, key: str | None = None) -> None:
+        if key is None:
+            self._cache.clear()
+        else:
+            self._cache.pop(key, None)
+
+    def prune(self, *, keep: int = 50) -> None:
+        """会话太多时丢掉最久没更新的，防止内存无限增长。"""
+        if len(self._cache) <= keep:
+            return
+        for key in list(self._cache)[: len(self._cache) - keep]:
+            self._cache.pop(key, None)
 
 
 # --------------------------------------------------------------------------- #

@@ -807,6 +807,106 @@ def test_group_aggregation_disabled_when_zero(loaded) -> None:
     assert run(scenario()) == 3
 
 
+def test_group_context_is_actually_sent_to_jev(loaded) -> None:
+    """回归测试：判定时必须真的带上群聊上下文。
+
+    早期实现去读 ``event.message_obj.group_messages`` 等**不存在**的属性，
+    每次都静默返回空列表 —— 判定等于盲猜，而且不报错。
+    现在改为自己维护缓存，这个测试盯住"上下文确实进到了 state 里"。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {
+            "enable": True,
+            "judge_all_messages": True,
+            "aggregate_window_seconds": 0,
+            "min_message_length": 1,
+            "context_messages": 10,
+        }
+        plugin = _isolated_plugin(loaded, config)
+
+        captured = {}
+
+        from betterchat_core import Action, GroupVerdict
+
+        async def fake_judge(event, umo, settings, text, already_woken):
+            captured["context"] = plugin._group_context(event, umo, settings)  # noqa: SLF001
+            captured["text"] = text
+            return GroupVerdict(Action.IGNORE, "test")
+
+        plugin._judge_group = fake_judge  # noqa: SLF001
+
+        # 先来两条群消息，再来第三条触发判定
+        for text in ("第一句话够长了", "第二句话也够长"):
+            await plugin.on_group_message(FakeEvent(text, group=True))
+        await plugin.on_group_message(FakeEvent("第三句话同样长", group=True))
+        return captured
+
+    captured = run(scenario())
+    context = captured["context"]
+    assert context, "上下文不能为空 —— 否则判定就是在盲猜"
+    texts = [c.text for c in context]
+    assert "第一句话够长了" in texts
+    assert "第二句话也够长" in texts
+
+
+def test_group_context_respects_limit(loaded) -> None:
+    """context_messages 生效，不会把整个缓存都塞进去。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {
+            "enable": True,
+            "judge_all_messages": True,
+            "aggregate_window_seconds": 0,
+            "min_message_length": 1,
+            "context_messages": 2,
+        }
+        plugin = _isolated_plugin(loaded, config)
+        captured = {}
+
+        from betterchat_core import Action, GroupVerdict
+
+        async def fake_judge(event, umo, settings, text, already_woken):
+            captured["context"] = plugin._group_context(event, umo, settings)  # noqa: SLF001
+            return GroupVerdict(Action.IGNORE, "test")
+
+        plugin._judge_group = fake_judge  # noqa: SLF001
+        for i in range(5):
+            await plugin.on_group_message(FakeEvent(f"第{i}句话都够长了", group=True))
+        return captured["context"]
+
+    context = run(scenario())
+    assert len(context) <= 2
+
+
+def test_context_survives_gate_rejection(loaded) -> None:
+    """被本地闸门拦下的消息也要进上下文。
+
+    否则"有没有人接话"的判断会缺片：前面几句都被闸门挡掉，
+    后面判定时看到的上下文是空的。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {
+            "enable": True,
+            "judge_all_messages": True,
+            "aggregate_window_seconds": 0,
+            "min_message_length": 50,  # 故意设很大，让消息被闸门拦下
+            "context_messages": 10,
+        }
+        plugin = _isolated_plugin(loaded, config)
+
+        # 这条会被 TOO_SHORT 拦掉
+        await plugin.on_group_message(FakeEvent("短消息", group=True))
+        return plugin.transcripts.recent("test:group:1")  # noqa: SLF001
+
+    recorded = run(scenario())
+    assert [c.text for c in recorded] == ["短消息"]
+
+
 # --------------------------------------------------------------------------- #
 # 生命周期
 # --------------------------------------------------------------------------- #

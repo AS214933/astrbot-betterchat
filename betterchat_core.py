@@ -809,6 +809,8 @@ class ChatLine:
     is_self: bool = False
     at_bot: bool = False
     seconds_ago: float | None = None
+    message_id: str = ""
+    """平台消息 ID，仅用于去重（事件可能被多个 handler 看到）。"""
 
 
 def _chat_line_payload(line: ChatLine) -> dict[str, object]:

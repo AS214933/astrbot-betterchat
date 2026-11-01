@@ -44,7 +44,7 @@ try:  # 包内导入（AstrBot 正常加载方式）
         JevError,
         build_group_questions,
     )
-    from .betterchat_state import RateLimiter, RuntimeState
+    from .betterchat_state import RateLimiter, RuntimeState, TranscriptCache
 except ImportError:  # 直接以路径加载时的兜底
     from betterchat_core import (
         Action,
@@ -62,7 +62,7 @@ except ImportError:  # 直接以路径加载时的兜底
         resolve_fail_policy,
     )
     from betterchat_jev import JevClient, JevConfig, JevError, build_group_questions
-    from betterchat_state import RateLimiter, RuntimeState
+    from betterchat_state import RateLimiter, RuntimeState, TranscriptCache
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -106,6 +106,9 @@ class BetterChatPlugin(Star):
         self.group_agg = GroupAggregator()
         self.state = RuntimeState()
         self.limiter = RateLimiter(_plugin_data_dir() / "state.json")
+        # 群聊上下文缓存。AstrBot 的 event 只带当前这一条消息，
+        # 要"最近几条群消息"只能自己记（同类插件也都是这么做的）。
+        self.transcripts = TranscriptCache(maxlen=30)
         self.jev = JevClient(self._jev_config())
 
         # Jev 失败日志的去重状态（避免群聊里逐条刷屏）。
@@ -444,10 +447,16 @@ class BetterChatPlugin(Star):
 
         umo = event.unified_msg_origin
 
+        text = (event.message_str or "").strip()
+
+        # 先把这条消息记进上下文缓存，再去判定。
+        # 必须在闸门之前 —— 被本地闸门拦下的消息同样是群聊的一部分，
+        # 少了它们，后面"有没有人接话"的判断就会缺片。
+        if not self._is_self_message(event):
+            self._remember_group_message(umo, event, text)
+
         if self._is_self_message(event):
             return
-
-        text = (event.message_str or "").strip()
         already_woken = bool(getattr(event, "is_at_or_wake_command", False))
 
         decision = gate_reason(
@@ -761,14 +770,31 @@ class BetterChatPlugin(Star):
         """
         if limit <= 0:
             return []
-        for getter in ("group_messages", "history", "recent_messages"):
-            try:
-                value = getattr(event.message_obj, getter, None)
-            except Exception:  # noqa: BLE001
-                continue
-            if isinstance(value, list) and value:
-                return [self._to_chat_line(item) for item in value[-limit:]]
-        return []
+        # 从自己维护的缓存里取（AstrBot 的 event 只有当前这一条消息，
+        # 没有"最近 N 条"这种东西）。
+        return self.transcripts.recent(event.unified_msg_origin, limit)
+
+    def _remember_group_message(
+        self, umo: str, event: AstrMessageEvent, text: str
+    ) -> None:
+        """把一条群消息记进上下文缓存。
+
+        同一条消息可能被多个 handler 看到，用 ``message_id`` 去重。
+        """
+        if not text:
+            return
+        message_id = str(getattr(event.message_obj, "message_id", "") or "")
+        self.transcripts.record(
+            umo,
+            ChatLine(
+                sender=self._sender_name(event),
+                text=text[:500],
+                is_self=self._is_self_message(event),
+                at_bot=bool(getattr(event, "is_at_or_wake_command", False)),
+                seconds_ago=0.0,
+                message_id=message_id,
+            ),
+        )
 
     def _to_chat_line(self, item: object) -> object:
         """把历史消息（对象或字符串）转成 :class:`ChatLine`。"""

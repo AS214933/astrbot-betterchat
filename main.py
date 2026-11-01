@@ -101,6 +101,11 @@ class BetterChatPlugin(Star):
         self.limiter = RateLimiter(_plugin_data_dir() / "state.json")
         self.jev = JevClient(self._jev_config())
 
+        # Jev 失败日志的去重状态（避免群聊里逐条刷屏）。
+        self._last_jev_error: str | None = None
+        self._last_jev_error_at: float = 0.0
+        self._jev_error_cooldown: float = 300.0
+
         self._log_startup()
 
     # ------------------------------------------------------------------ #
@@ -144,11 +149,22 @@ class BetterChatPlugin(Star):
                 f"[BetterChat] 群聊 Jev 闸门已禁用（{missing}）。"
                 "私聊合并功能不受影响。"
             )
-        else:
+            return
+
+        logger.info(
+            f"[BetterChat] Jev 渠道={jev.channel} endpoint={jev.endpoint()} "
+            f"model={jev.model if jev.channel == 'official' else jev.cf_model} "
+            f"timeout={jev.timeout_seconds}s"
+        )
+        if jev.channel == "cloudflare":
+            # 这是一个很容易踩的坑：Cloudflare 的免费 Neurons 只覆盖自托管
+            # 的 @cf/ 模型，第三方模型（typesafe/jev）需要预付额度。
+            # 提前说清楚，比等第一条群消息报 402 要好。
             logger.info(
-                f"[BetterChat] Jev 渠道={jev.channel} endpoint={jev.endpoint()} "
-                f"model={jev.model if jev.channel == 'official' else jev.cf_model} "
-                f"timeout={jev.timeout_seconds}s"
+                "[BetterChat] 提示：Cloudflare 渠道的免费 Neurons 额度"
+                "只覆盖 @cf/ 自托管模型；typesafe/jev 属于第三方模型，"
+                "需要 AI Gateway 预付额度。如遇 402/2021，"
+                "请改用「TypeSafe 官方」渠道，即可避免该费用。"
             )
 
     # ------------------------------------------------------------------ #
@@ -161,16 +177,25 @@ class BetterChatPlugin(Star):
 
         带图片、文件、语音、合并转发的消息语义复杂，重建消息链容易出错，
         直接放行走原生流程更安全。
+
+        注意：AstrBot 的组件 ``type`` 是 ``ComponentType(str, Enum)``，
+        它**同时**继承 ``str`` 和 ``Enum``，所以 ``type(x) is str`` 恒为
+        ``False`` —— 必须用等值比较。这个坑曾经让合并功能整体失效：
+        每条消息都被判成"非纯文本"而直接放行。
         """
         message_obj = getattr(event, "message_obj", None)
         chain = getattr(message_obj, "message", None)
         if not isinstance(chain, list) or not chain:
             return True
-        return all(
-            type(getattr(comp, "type", None)) is str
-            and getattr(comp, "type", "") == _PLAIN_ONLY
-            for comp in chain
-        )
+        for comp in chain:
+            kind = getattr(comp, "type", None)
+            if kind is None:
+                continue
+            # ComponentType 可以与字符串直接比较（str 混入）。
+            if kind == _PLAIN_ONLY:
+                continue
+            return False
+        return True
 
     @staticmethod
     def _replace_text(event: AstrMessageEvent, text: str) -> None:
@@ -467,6 +492,28 @@ class BetterChatPlugin(Star):
             f" answered={verdict.already_answered}"
         )
 
+    def _log_jev_failure(self, exc: Exception) -> None:
+        """Jev 失败时记日志，但同一条错误在冷却期内只记一次。
+
+        群聊里每条消息都会触发判定，如果服务端一直报同一个错，
+        逐条打警告会把日志刷爆，反而淹没了真正有用的信息。
+        状态变化时（错误内容不同，或距离上次已过一段时间）才重新提示。
+        """
+        import time
+
+        message = str(exc)
+        now = time.monotonic()
+        recently_warned = (
+            self._last_jev_error == message
+            and now - self._last_jev_error_at < self._jev_error_cooldown
+        )
+        if recently_warned:
+            logger.debug(f"[BetterChat] Jev 判定失败（重复，已折叠）: {message}")
+        else:
+            logger.warning(f"[BetterChat] Jev 判定失败，降级处理: {message}")
+            self._last_jev_error = message
+            self._last_jev_error_at = now
+
     async def _judge_group(
         self,
         event: AstrMessageEvent,
@@ -488,7 +535,7 @@ class BetterChatPlugin(Star):
                 state=state, questions=build_group_questions()
             )
         except JevError as exc:
-            logger.warning(f"[BetterChat] Jev 判定失败，降级处理: {exc}")
+            self._log_jev_failure(exc)
             # fail_policy 属于群聊闸门配置，不属于 Jev 渠道配置。
             action = resolve_fail_policy(
                 settings.fail_policy, already_woken=already_woken

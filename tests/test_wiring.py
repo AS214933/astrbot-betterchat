@@ -35,13 +35,32 @@ class _EventMessageType(enum.Flag):
     ALL = GROUP_MESSAGE | PRIVATE_MESSAGE | OTHER_MESSAGE
 
 
+class _ComponentType(str, enum.Enum):
+    """照抄 AstrBot 的 ``ComponentType(str, Enum)``。
+
+    关键点：它同时继承 str 和 Enum，所以 ``type(x) is str`` 为 False，
+    但 ``x == "Plain"`` 为 True。用真实语义的替身才能覆盖这个坑。
+    """
+
+    Plain = "Plain"
+    Image = "Image"
+    Reply = "Reply"
+
+
 class _Plain:
     """对应 ``astrbot.core.message.components.Plain``。"""
 
-    type = "Plain"
+    type = _ComponentType.Plain
 
     def __init__(self, text: str) -> None:
         self.text = text
+
+
+class _Image:
+    type = _ComponentType.Image
+
+    def __init__(self, url: str = "x") -> None:
+        self.url = url
 
 
 class _Logger:
@@ -342,6 +361,29 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def test_plain_text_detection_handles_str_enum(loaded) -> None:
+    """回归测试：``ComponentType(str, Enum)`` 必须被判为纯文本。
+
+    曾经这里用了 ``type(x) is str``，而 ``ComponentType`` 是 str 的**子类**，
+    于是纯文本被判成"非纯文本"，合并被整体跳过 —— 表现就是每条消息都
+    立即回复，合并功能形同虚设。
+    """
+
+    class Event:
+        def __init__(self, chain):
+            self.message_obj = types.SimpleNamespace(message=chain)
+
+    plugin_cls = loaded.module.BetterChatPlugin
+    # 纯文本 -> 应当参与合并
+    assert plugin_cls._is_plain_text(Event([_Plain("你好")])) is True
+    assert plugin_cls._is_plain_text(Event([_Plain("a"), _Plain("b")])) is True
+    # 含图片 -> 不参与合并
+    assert plugin_cls._is_plain_text(Event([_Image()])) is False
+    assert plugin_cls._is_plain_text(Event([_Plain("a"), _Image()])) is False
+    # 空链 -> 保守地当作纯文本
+    assert plugin_cls._is_plain_text(Event([])) is True
+
+
 def test_single_private_message_passes_through(loaded) -> None:
     """单条消息：窗口到期后合并文本写回事件，并交还原生流程。"""
 
@@ -597,6 +639,52 @@ def test_group_gate_records_reply_for_rate_limiting(loaded) -> None:
             return plugin.limiter.count(umo)
 
     assert run(scenario()) == 1
+
+
+def test_jev_failure_is_logged_once_per_cooldown(loaded) -> None:
+    """群聊里每条消息都会触发判定，同一个错误不能逐条刷屏。"""
+
+    async def scenario():
+        plugin = loaded.module.BetterChatPlugin(
+            context=None, config=FakeConfig(base_config())
+        )
+        before = len(loaded.stub.logger.records)
+
+        from betterchat_jev import JevError
+
+        for _ in range(5):
+            plugin._log_jev_failure(JevError("HTTP 400 code 7000"))  # noqa: SLF001
+
+        new_records = loaded.stub.logger.records[before:]
+        warnings = [r for r in new_records if r[0] == "warning"]
+        debugs = [r for r in new_records if r[0] == "debug"]
+        return len(warnings), len(debugs)
+
+    warnings, debugs = run(scenario())
+    assert warnings == 1, "同一条错误只应警告一次"
+    assert debugs == 4, "其余应降级为 debug"
+
+
+def test_jev_failure_logs_again_when_error_changes(loaded) -> None:
+    """错误内容变了说明是新问题，应当重新提示。"""
+
+    async def scenario():
+        plugin = loaded.module.BetterChatPlugin(
+            context=None, config=FakeConfig(base_config())
+        )
+        before = len(loaded.stub.logger.records)
+
+        from betterchat_jev import JevError
+
+        plugin._log_jev_failure(JevError("HTTP 400 code 7000"))  # noqa: SLF001
+        plugin._log_jev_failure(JevError("HTTP 402 code 2021"))  # noqa: SLF001
+
+        return [
+            r for r in loaded.stub.logger.records[before:] if r[0] == "warning"
+        ]
+
+    warnings = run(scenario())
+    assert len(warnings) == 2
 
 
 # --------------------------------------------------------------------------- #

@@ -105,7 +105,16 @@ def test_official_request_carries_model_in_body() -> None:
     assert captured.url == "https://api.typesafe.ai/v1/systemone"
 
 
-def test_cloudflare_request_omits_model_and_uses_run_path() -> None:
+def test_cloudflare_request_uses_run_path_with_model_in_body() -> None:
+    """Cloudflare 走通用入口 ``/ai/run``，模型名在请求体、参数包在 ``input``。
+
+    这个形状是**用真实账号实测**确定的，不是从文档推断：
+
+    * ``/ai/run/typesafe/jev``      → 400 ``code 7000 "No route for that URI"``
+    * ``/ai/run/@cf/typesafe/jev``  → 400 ``code 5007 "No such model"``
+    * ``/ai/run`` + ``{model, input}`` → 请求被接受（实测只是在余额上返回 402）
+    """
+
     async def scenario():
         client = JevClient(CF_CONFIG)
         captured = install_fake_post(
@@ -125,13 +134,64 @@ def test_cloudflare_request_omits_model_and_uses_run_path() -> None:
 
     captured = run(scenario())
     assert captured.payload is not None
-    # Cloudflare 的模型在 URL 里，body 里不能有 model。
-    assert "model" not in captured.payload
-    assert captured.payload["questions"]["should_reply"]["type"] == "noul"
-    assert (
-        captured.url
-        == "https://api.cloudflare.com/client/v4/accounts/acc123/ai/run/typesafe/jev"
+    # 通用入口 + 模型在 body。
+    assert captured.url == (
+        "https://api.cloudflare.com/client/v4/accounts/acc123/ai/run"
     )
+    assert captured.payload["model"] == "typesafe/jev"
+    # 真正的参数包在 input 里，而不是平铺在顶层。
+    assert set(captured.payload) == {"model", "input"}
+    inner = captured.payload["input"]
+    assert inner["state"] == {"msg": "hi"}
+    assert inner["questions"]["should_reply"]["type"] == "noul"
+    # 绝对不能出现 @cf/ 前缀 —— 那会被 Cloudflare 当成内置模型而拒绝。
+    assert not captured.payload["model"].startswith("@cf/")
+
+
+def test_cloudflare_model_prefix_is_stripped_of_cf_slash() -> None:
+    """用户如果填了 ``@cf/typesafe/jev``，要能自动纠正。
+
+    注意必须走 ``from_config``，规范化就发生在那里 —— 直接构造
+    ``JevConfig`` 会绕过它（这也是这个测试第一版失败的原因）。
+    """
+    config = JevConfig.from_config(
+        {
+            "channel": "cloudflare",
+            "cf_account_id": "acc123",
+            "cf_api_token": "t",
+            "cf_model": "@cf/typesafe/jev",
+        }
+    )
+    assert config.cf_model == "typesafe/jev"
+
+    async def scenario():
+        client = JevClient(config)
+        captured = install_fake_post(
+            client,
+            {
+                "result": {"answers": {"should_reply": {"noul": 0.5}}},
+                "success": True,
+            },
+        )
+        await client.decide(state="x", questions=QUESTIONS)
+        return captured
+
+    captured = run(scenario())
+    assert captured.payload is not None
+    assert captured.payload["model"] == "typesafe/jev"
+
+
+def test_builtin_cf_models_keep_their_prefix() -> None:
+    """纠正只针对 typesafe 命名空间，不能误伤 Cloudflare 的内置模型。"""
+    config = JevConfig.from_config(
+        {
+            "channel": "cloudflare",
+            "cf_account_id": "a",
+            "cf_api_token": "t",
+            "cf_model": "@cf/meta/llama-3.2-1b-instruct",
+        }
+    )
+    assert config.cf_model == "@cf/meta/llama-3.2-1b-instruct"
 
 
 def test_api_base_with_full_endpoint_is_not_double_appended() -> None:
@@ -302,6 +362,46 @@ def test_success_resets_breaker_counter() -> None:
 # --------------------------------------------------------------------------- #
 # 问题模板
 # --------------------------------------------------------------------------- #
+
+
+def test_cloudflare_insufficient_balance_is_explained() -> None:
+    """402/2021 不能只报原始 JSON —— 用户要看得出该去改什么。"""
+    from betterchat_jev import _explain_http_error
+
+    message = _explain_http_error(
+        status=402,
+        body=(
+            '{"errors":[{"message":"Insufficient balance; add money to your '
+            'gateway or use BYOK","code":2021}],"success":false,"result":{}}'
+        ),
+        channel="cloudflare",
+    )
+    assert "余额不足" in message
+    # 必须点出两条实际出路。
+    assert "免费 Neurons" in message
+    assert "官方" in message
+
+
+def test_cloudflare_route_error_is_explained() -> None:
+    """7000 = 路由不存在，提示要指向正确的 URL 形状。"""
+    from betterchat_jev import _explain_http_error
+
+    message = _explain_http_error(
+        status=400,
+        body='{"success":false,"errors":[{"code":7000,"message":"No route for that URI"}]}',
+        channel="cloudflare",
+    )
+    assert "路由不存在" in message
+    assert "/ai/run" in message
+
+
+def test_auth_error_is_explained() -> None:
+    from betterchat_jev import _explain_http_error
+
+    message = _explain_http_error(
+        status=401, body='{"detail":"bad key"}', channel="official"
+    )
+    assert "认证失败" in message
 
 
 def test_group_questions_are_three_nouls() -> None:

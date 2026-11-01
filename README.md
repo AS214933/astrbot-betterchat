@@ -106,12 +106,25 @@ Jev 用极低成本判断这两件事。
 
 | | TypeSafe 官方 | Cloudflare Workers AI |
 |---|---|---|
-| 端点 | `POST https://api.typesafe.ai/v1/systemone` | `POST https://api.cloudflare.com/client/v4/accounts/{id}/ai/run/typesafe/jev` |
-| 模型位置 | 请求体里的 `model` | **URL 路径里** |
+| 端点 | `POST api.typesafe.ai/v1/systemone` | `POST api.cloudflare.com/client/v4/accounts/{id}/ai/run` |
+| 模型位置 | 请求体的 `model` | 请求体的 `model`，参数包在 `input` 里 |
 | 响应 | `{model, answers, usage}` | 外面套一层 `{result, success, errors}` |
 | 需要 | API Key | 账号 ID + API Token |
 
-价格相同（$0.042/百万输入 token，输出免费），但**模型版本可能不同步** —— 官方 `jev-latest` 和 Cloudflare 上的版本号不一定一样。切换渠道后请查看启动日志确认实际生效的版本。
+> ⚠️ **Cloudflare 的免费额度不覆盖第三方模型。**
+> Workers AI 每天送的 10,000 Neurons 只适用于 Cloudflare **自托管**的 `@cf/` 模型
+> （Llama、Qwen、Whisper 等）。`typesafe/jev` 属于第三方模型，走 AI Gateway
+> **统一计费**，需要先充值预付额度，否则会返回
+> `HTTP 402 / code 2021 Insufficient balance`。
+>
+> 想零成本使用，请选 **TypeSafe 官方**渠道（Jev 本身按 $0.042/百万输入 token
+> 计费，输出免费，日常群聊基本花不到钱）。
+
+> 📌 **Cloudflare 的 URL 形状容易踩坑。** 第三方模型**不能**写成
+> `/ai/run/typesafe/jev`（会返回 `400 code 7000 No route for that URI`），
+> 也不能带 `@cf/` 前缀（会返回 `400 code 5007 No such model`）。
+> 正确写法是 `/ai/run` + 请求体 `{"model": "typesafe/jev", "input": {...}}`。
+> 本插件已按此实现；如果你手填了 `@cf/typesafe/jev`，会自动纠正。
 
 ### 降级：任何失败都不影响可用性
 

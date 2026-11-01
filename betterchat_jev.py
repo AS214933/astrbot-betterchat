@@ -101,6 +101,13 @@ class JevConfig:
         if channel not in ("official", "cloudflare"):
             channel = "official"
 
+        cf_model = text("cf_model", DEFAULT_CF_MODEL) or DEFAULT_CF_MODEL
+        # Cloudflare 的第三方模型不能带 ``@cf/`` 前缀（那是内置模型的命名空间，
+        # 传 ``@cf/typesafe/jev`` 会返回 "No such model"）。用户手填错误前缀时
+        # 自动纠正 —— 只针对 typesafe 命名空间，不影响内置模型名。
+        if cf_model.startswith("@cf/typesafe/"):
+            cf_model = cf_model[len("@cf/") :]
+
         return cls(
             channel=channel,
             api_key=text("api_key", ""),
@@ -108,7 +115,7 @@ class JevConfig:
             model=text("model", DEFAULT_MODEL) or DEFAULT_MODEL,
             cf_account_id=text("cf_account_id", ""),
             cf_api_token=text("cf_api_token", ""),
-            cf_model=text("cf_model", DEFAULT_CF_MODEL) or DEFAULT_CF_MODEL,
+            cf_model=cf_model,
             timeout_seconds=max(0.1, number("timeout_seconds", 3.0)),
             max_concurrency=max(1, integer("max_concurrency", 4)),
             breaker_failures=max(1, integer("breaker_failures", 3)),
@@ -141,12 +148,20 @@ class JevConfig:
     # -- 端点 ------------------------------------------------------------- #
 
     def endpoint(self) -> str:
-        """拼出真正要请求的 URL。"""
+        """拼出真正要请求的 URL。
+
+        注意 Cloudflare 的两种路由**不是**等价的（实测结论）：
+
+        * ``/ai/run``           —— 通用入口，模型写在请求体的 ``model`` 里。**可用。**
+        * ``/ai/run/{model}``   —— 只接受以 ``@cf/`` 开头的内置模型；
+          传入第三方模型名（如 ``typesafe/jev``）会直接返回
+          ``400 code 7000 "No route for that URI"``。
+
+        所以这里统一走 ``/ai/run``，模型名通过请求体传递。
+        """
         if self.channel == "cloudflare":
-            base = DEFAULT_CF_BASE
             account = self.cf_account_id.strip()
-            model = self.cf_model.strip().lstrip("/")
-            return f"{base}/{account}/ai/run/{model}"
+            return f"{DEFAULT_CF_BASE}/{account}/ai/run"
 
         base = self.api_base.strip().rstrip("/")
         # 允许用户把完整 endpoint 也填进来（例如反代到别的路径）。
@@ -318,15 +333,13 @@ class JevClient:
         self, state: object, questions: Mapping[str, NoulQuestion]
     ) -> dict[str, Any]:
         payload_questions = {k: q.to_payload() for k, q in questions.items()}
+        body = {"state": state, "questions": payload_questions}
         if self.config.channel == "cloudflare":
-            # Cloudflare：模型在 URL 路径里，body 里不能带 model。
-            return {"state": state, "questions": payload_questions}
-        # 官方：model 是 body 的必填字段。
-        return {
-            "model": self.config.model,
-            "state": state,
-            "questions": payload_questions,
-        }
+            # Cloudflare 的通用入口 /ai/run 需要把模型名放在请求体里，
+            # 并把真正的参数包在 "input" 里（与官方渠道的裸 body 不同）。
+            return {"model": self.config.cf_model, "input": body}
+        # 官方：model 是 body 的必填字段，参数平铺。
+        return {"model": self.config.model, **body}
 
     @staticmethod
     def _unwrap(body: object) -> Mapping[str, Any]:
@@ -438,9 +451,53 @@ class JevClient:
             if response.status != 200:
                 text = await response.text()
                 raise JevError(
-                    f"HTTP {response.status}: {_summarize(text, limit=300)}"
+                    _explain_http_error(
+                        status=response.status, body=text, channel=self.config.channel
+                    )
                 )
             return await response.json(content_type=None)
+
+
+def _explain_http_error(*, status: int, body: str, channel: str) -> str:
+    """把 HTTP 错误翻译成**可操作**的提示。
+
+    只报告 ``HTTP 402: {...}`` 帮不上忙 —— 用户看不出该去改什么。
+    这里针对已知的错误码给出具体出路。
+    """
+    summary = _summarize(body, limit=300)
+
+    if channel == "cloudflare":
+        # 2021：第三方模型走统一计费，需要预付 AI Gateway 额度，
+        #       免费 Neurons 不覆盖第三方模型。
+        if status == 402 or "2021" in body:
+            return (
+                f"Cloudflare 余额不足（HTTP {status}）。"
+                "免费 Neurons 额度只覆盖 Cloudflare 自托管的 @cf/ 模型；"
+                "第三方模型（typesafe/jev）走统一计费，需要在 AI Gateway 里"
+                "充值预付额度，否则请改用「TypeSafe 官方」渠道。原始响应: "
+                f"{summary}"
+            )
+        # 7000：路由不存在 —— 通常是模型名带了 @cf/ 前缀，或端点写错。
+        if "7000" in body:
+            return (
+                f"Cloudflare 路由不存在（HTTP {status}）。"
+                "第三方模型的 URL 应为 /ai/run，模型名写在请求体里、且不能带 "
+                "@cf/ 前缀。原始响应: "
+                f"{summary}"
+            )
+        # 5007：模型不存在。
+        if "5007" in body:
+            return (
+                f"Cloudflare 找不到该模型（HTTP {status}）。"
+                "请确认 cf_model 填的是 typesafe/jev（不带 @cf/）。原始响应: "
+                f"{summary}"
+            )
+
+    if status == 401:
+        return f"认证失败（HTTP 401），请检查 API Key / Token 是否正确。原始响应: {summary}"
+    if status in (429, 529):
+        return f"请求被限流（HTTP {status}），稍后重试。原始响应: {summary}"
+    return f"HTTP {status}: {summary}"
 
 
 def aiohttp_timeout(seconds: float) -> Any:

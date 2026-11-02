@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 try:  # 包内导入（AstrBot 正常加载方式）
@@ -110,6 +111,21 @@ EXTRA_GROUP_VERDICT = "betterchat_group_verdict"
 
 #: 合并窗口里要跳过的消息类型 —— 只合并纯文本。
 _PLAIN_ONLY = "Plain"
+
+#: 文本形式的 @ 标记。
+#:
+#: QQ 官方平台（qq_official）的消息适配器**只把 @Bot 自己**的 mention 转成
+#: ``At`` 组件，@ 别人的 mention 会被原样留在 ``message_str`` 里，形如
+#: ``<@2879588DE5953607C534F862B4AFFE5C>``。所以光看 ``At`` 组件在那边
+#: 永远检测不到"@ 了别人"。这里把三种已知写法都覆盖：
+#:
+#: * ``<@openid>``            —— QQ 官方群聊
+#: * ``<@!123456>``           —— Discord，``!`` 表示昵称
+#: * ``<qqbot-at-user id="…"/>`` —— QQ 官方的另一种标记
+_AT_MARKUP_RE = re.compile(
+    r"<qqbot-at-user\s+id=\"([^\"]+)\"\s*/>"   # 组 1
+    r"|<@!?([^>\s]+)>",                        # 组 2
+)
 
 
 def _plugin_data_dir() -> Any:
@@ -684,6 +700,9 @@ class BetterChatPlugin(Star):
             already_woken=already_woken,
             # @ 了别人 → 不抢答两人之间的对话。
             addressed_to_other=self.at_other(event),
+            # 「主动帮没人接的问题」默认关闭 —— 群里两人正常对话时
+            # 「有人提问还没人答」太常见，放行等于见缝插针。
+            help_unaddressed=settings.help_unaddressed,
             reply_threshold=jev_config.reply_threshold,
             already_answered_threshold=jev_config.already_answered_threshold,
         )
@@ -696,14 +715,23 @@ class BetterChatPlugin(Star):
     def at_other(event: AstrMessageEvent) -> bool:
         """这条消息是否 @ 了**别人**（不是 Bot）。
 
-        为什么必须单独判断：群里 A 问 B「你这是哪个大学的」，从 Jev 的角度看
-        就是个「有人提问、没人回答」的场景，open_question 会很高。如果不知道
-        那是两人之间的对话，Bot 就会抢答 —— 实测踩过这个坑。
+        必须**双轨检测**，因为不同平台暴露 @ 的方式不一样：
 
-        平台层面已经确定了这个事实（At 组件的 qq 字段），比让模型从文本里
-        猜 "@xxx" 是不是自己可靠得多。
+        * **通用平台**（OneBot / Telegram / Discord 等）：@ 会变成 ``At``
+          组件，带 ``qq`` 字段。
+        * **QQ 官方平台**（qq_official）：适配器**只把 @Bot 自己**的 mention
+          转成 ``At`` 组件，**@ 别人的 mention 被原样留在 ``message_str``
+          里**，形如 ``<@2879588DE5953607C534F862B4AFFE5C>``。
+          来源：``qqofficial_platform_adapter.py`` 的
+          ``bot_mentions = [m for m in message.mentions if m.is_you is True]``
+          以及随后的 ``if group_mentioned: msg.append(At(...))``。
+
+        只查 ``At`` 组件会在 QQ 官方平台上永远返回 False。这个坑很隐蔽：
+        单测能过（构造的假消息链里有 At），线上却完全不生效。
         """
         self_id = str(event.get_self_id() or "")
+
+        # 轨道一：标准 At 组件。
         try:
             for comp in event.get_messages():
                 kind = getattr(comp, "type", None)
@@ -713,8 +741,17 @@ class BetterChatPlugin(Star):
                 if not target or target in (self_id, "all"):
                     continue
                 return True
-        except Exception:  # noqa: BLE001 - 消息链结构异常时保守处理
+        except Exception:  # noqa: BLE001 - 消息链异常时继续走文本检测
+            pass
+
+        # 轨道二：文本里的 @ 标记（QQ 官方把 @别人 留成了纯文本）。
+        text = (event.message_str or "").strip()
+        if not text:
             return False
+        for match in _AT_MARKUP_RE.finditer(text):
+            target = match.group(1) or match.group(2) or ""
+            if target and target not in (self_id, "all"):
+                return True
         return False
 
     @staticmethod

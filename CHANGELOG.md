@@ -15,6 +15,41 @@
 
 ---
 
+## [1.4.2] - 2026-11-02
+
+### 修复
+
+- **1.4.1 的 @别人 修复在 QQ 官方平台上完全没生效**。这是个很隐蔽的坑：
+  AstrBot 的 `qqofficial` 适配器**只把 @Bot 自己**的 mention 转成 `At` 组件，
+  @ 别人的 mention 被原样留在 `message_str` 里，形如 `<@openid>`：
+
+  ```python
+  bot_mentions = [m for m in message.mentions if m.is_you is True]
+  if group_mentioned:
+      msg.append(At(qq=abm.self_id, ...))
+  ```
+
+  所以只遍历 `At` 组件的实现，在这个平台上**永远返回 False**。单测能过
+  （构造的假消息链里塞了 `At`），线上却完全不生效。
+
+  改为**双轨检测**：先查 `At` 组件（通用平台），再匹配文本里的
+  `<@...>` / `<@!...>` / `<qqbot-at-user id="..." />`（QQ 官方）。
+
+- **「主动帮没人接的问题」太激进**。这条规则让 Bot 见话就接：
+  群里两个人正常对话时「有人提问、还没人回答」是最常见的状态，
+  `open_question` 必然很高，于是每条都插话。
+
+  改为**默认关闭**，需要的用户在面板里手动开启。
+  @ 了别人的消息无论开关都不抢答。
+
+### 说明
+
+- 横向对比过：`astrbot_plugin_reply_gate` 只检测 @Bot、不处理 @别人；
+  `astrbot_plugin_smart_wake` 的 `ignore_at_other` 同样只查 `At` 组件，
+  在 QQ 官方平台上也是空开关。所以这条没有可直接借鉴的现成实现。
+
+---
+
 ## [1.4.1] - 2026-11-02
 
 ### 修复
@@ -300,7 +335,8 @@
 
 ---
 
-[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.1...HEAD
+[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.2...HEAD
+[1.4.2]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/AS214933/astrbot-betterchat/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/AS214933/astrbot-betterchat/compare/v1.3.0...v1.3.1

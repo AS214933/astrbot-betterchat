@@ -152,6 +152,12 @@
         "hint": "开启：不 @ 也可能被回复。关闭：只判定被 @ / 引用 / 唤醒词的消息，Jev 仅用来过滤「叫了但没必要回」的情况。",
         "default": true
       },
+      "help_unaddressed": {
+        "type": "bool",
+        "description": "主动帮「没人接的问题」",
+        "hint": "开启后，群里有人提了个还没人回答的问题时，即使没 @ Bot 也会插话。默认关闭 —— 群里两个人正常对话时「有人提问、还没人答」太常见，开启会让 Bot 见话就接。注意：@ 了别人的消息无论开关都不会抢答。",
+        "default": false
+      },
       "aggregate_window_seconds": {
         "type": "float",
         "description": "判定前聚合窗口（秒）",

@@ -211,9 +211,19 @@ def test_already_answered_beats_woken() -> None:
     assert verdict.action is Action.IGNORE
 
 
-def test_respond_to_unanswered_question_in_group() -> None:
-    """群里有人提了个没人接的问题，主动帮一把。"""
+def test_help_unaddressed_is_off_by_default() -> None:
+    """「主动帮没人接的问题」默认关闭。
+
+    群里两个人正常对话时「有人提问、还没人回答」太常见，
+    放行等于见缝插针 —— 实测把 Bot 弄成了见话就接。
+    """
     verdict = decide(addressed=0.1, open_question=0.9)
+    assert verdict.action is Action.IGNORE
+
+
+def test_respond_to_unanswered_question_when_enabled() -> None:
+    """开启后才主动帮。"""
+    verdict = decide(addressed=0.1, open_question=0.9, help_unaddressed=True)
     assert verdict.action is Action.RESPOND
     assert verdict.reason == "unanswered_question"
 
@@ -278,6 +288,18 @@ def test_unknown_policy_falls_back_to_closed() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def test_does_not_answer_when_addressed_to_someone_else_even_if_enabled() -> None:
+    """即使开启了「主动帮」，@ 了别人也不抢答。"""
+    verdict = decide(
+        addressed=0.06,
+        open_question=0.95,
+        already_answered=0.0,
+        addressed_to_other=True,
+        help_unaddressed=True,
+    )
+    assert verdict.action is Action.IGNORE
+
+
 def test_does_not_answer_when_addressed_to_someone_else() -> None:
     """回归测试：@ 了别人的提问，不该被当成"没人接的问题"抢答。
 
@@ -294,13 +316,14 @@ def test_does_not_answer_when_addressed_to_someone_else() -> None:
     assert verdict.action is Action.IGNORE
 
 
-def test_still_helps_when_no_specific_target() -> None:
-    """没 @ 任何人的提问，仍然主动帮。"""
+def test_still_helps_when_no_specific_target_and_enabled() -> None:
+    """开启后，没 @ 任何人的提问仍然主动帮。"""
     verdict = decide(
         addressed=0.06,
         open_question=0.95,
         already_answered=0.0,
         addressed_to_other=False,
+        help_unaddressed=True,
     )
     assert verdict.action is Action.RESPOND
     assert verdict.reason == "unanswered_question"

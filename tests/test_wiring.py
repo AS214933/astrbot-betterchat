@@ -1122,6 +1122,61 @@ def test_group_gate_ignores_message_addressed_to_other(loaded) -> None:
     assert event.call_llm is True, "@ 了别人的对话不该被插话"
 
 
+def test_at_other_detects_qq_official_text_markup(loaded) -> None:
+    """回归测试：QQ 官方平台的 @别人 是**纯文本**，不是 At 组件。
+
+    这是线上实际踩到的坑。AstrBot 的 qqofficial 适配器只把 **@Bot 自己** 的
+    mention 转成 ``At`` 组件：
+
+        bot_mentions = [m for m in message.mentions if m.is_you is True]
+        if group_mentioned:
+            msg.append(At(qq=abm.self_id, ...))
+
+    @ 别人的 mention 被原样留在 ``message_str`` 里，形如 ``<@openid>``。
+    所以只遍历 ``At`` 组件的实现，在这个平台上永远返回 False ——
+    单测能过（假消息链里塞了 At），线上完全不生效。
+    """
+    plugin = loaded.module.BetterChatPlugin
+
+    # 没有任何 At 组件，@ 只出现在文本里
+    for text in (
+        "<@2879588DE5953607C534F862B4AFFE5C> 有没有插件推荐",
+        "<@!123456789> hi",
+        '<qqbot-at-user id="abc123" /> 你好',
+    ):
+        event = FakeEvent(text, group=True)
+        event.message_obj.message = [_Plain(text)]
+        assert plugin.at_other(event) is True, f"未识别文本 @ 标记: {text!r}"
+
+    # @ 自己的文本标记 → 不算「@ 别人」
+    event = FakeEvent("<@bot> 你好", group=True)
+    event.message_obj.message = [_Plain("<@bot> 你好")]
+    assert plugin.at_other(event) is False
+
+
+def test_at_other_ignores_plain_text_without_mentions(loaded) -> None:
+    """普通文本不能被误判成 @。"""
+    plugin = loaded.module.BetterChatPlugin
+    for text in ("<重要> 注意一下", "a < b > c", "没有任何 at"):
+        event = FakeEvent(text, group=True)
+        event.message_obj.message = [_Plain(text)]
+        assert plugin.at_other(event) is False, f"误判: {text!r}"
+
+
+def test_help_unaddressed_off_by_default(loaded) -> None:
+    """「主动帮没人接的问题」默认关闭。
+
+    实测把 Bot 弄成了见话就接：群里两人正常对话时
+    「有人提问、还没人回答」是最常见的状态。
+    """
+
+    async def scenario():
+        plugin = _isolated_plugin(loaded, FakeConfig(base_config()))
+        return plugin._group_settings().help_unaddressed  # noqa: SLF001
+
+    assert run(scenario()) is False
+
+
 # --------------------------------------------------------------------------- #
 # 生命周期
 # --------------------------------------------------------------------------- #

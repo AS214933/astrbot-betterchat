@@ -588,6 +588,12 @@ class GroupSettings:
     min_interval_seconds: int = 120
     bot_cooldown_seconds: int = 90
     context_messages: int = 10
+    help_unaddressed: bool = False
+    """没被叫到时，是否主动帮「没人接的问题」。
+
+    默认关闭。这条规则最容易显得 Bot 在多管闲事 —— 群里两个人正常对话时
+    「有人提问、还没人回答」是极常见的状态，放行就等于见缝插针。
+    """
     aggregate_window_seconds: float = 1.5
     """判定前的静默聚合窗口（秒）。0 表示每条消息各判一次。"""
     fail_policy: str = "closed"
@@ -612,6 +618,7 @@ class GroupSettings:
                 0, _as_int(section.get("bot_cooldown_seconds", 90), 90)
             ),
             context_messages=max(0, _as_int(section.get("context_messages", 10), 10)),
+            help_unaddressed=bool(section.get("help_unaddressed", False)),
             aggregate_window_seconds=max(
                 0.0, min(10.0, _as_float(section.get("aggregate_window_seconds", 1.5), 1.5))
             ),
@@ -719,6 +726,7 @@ def decide_group_action(
     already_answered: float | None,
     already_woken: bool,
     addressed_to_other: bool = False,
+    help_unaddressed: bool = False,
     reply_threshold: float = 0.7,
     already_answered_threshold: float = 0.7,
 ) -> GroupVerdict:
@@ -766,7 +774,7 @@ def decide_group_action(
             already_answered,
         )
 
-    if open_question >= 0.85 and addressed <= 0.3:
+    if help_unaddressed and open_question >= 0.85 and addressed <= 0.3:
         # 群里有人提了个没人接的问题 —— 主动帮一把。
         #
         # 但**必须排除"在问某个具体的人"的情况**。群里 A 问 B「你这是哪个

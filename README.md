@@ -385,6 +385,8 @@ git clone https://github.com/AS214933/astrbot-betterchat.git
 | `private.total_seconds` | 8.0 | 从第一条算起的硬上限 |
 | `interrupt.mode` | graceful | 打断方式 |
 | `group.judge_all_messages` | true | true=可主动插话；false=只判被 @ 的 |
+| `group.help_unaddressed` | true | 有人提问没人接时，观望后再帮 |
+| `group.help_unaddressed_delay_seconds` | 90 | 观望多久没人接才帮 |
 | `group.max_replies_per_hour` | 8 | 每群每小时最多主动回复 |
 | `group.fail_policy` | closed | Jev 挂了是否放行 |
 | `jev.channel` | official | 官方 / Cloudflare |

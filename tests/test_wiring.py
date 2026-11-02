@@ -1163,18 +1163,92 @@ def test_at_other_ignores_plain_text_without_mentions(loaded) -> None:
         assert plugin.at_other(event) is False, f"误判: {text!r}"
 
 
-def test_help_unaddressed_off_by_default(loaded) -> None:
-    """「主动帮没人接的问题」默认关闭。
-
-    实测把 Bot 弄成了见话就接：群里两人正常对话时
-    「有人提问、还没人回答」是最常见的状态。
-    """
+def test_help_unaddressed_defaults_to_defer_mode(loaded) -> None:
+    """「主动帮没人接的问题」默认开启，但走观望而不是立即插话。"""
 
     async def scenario():
         plugin = _isolated_plugin(loaded, FakeConfig(base_config()))
-        return plugin._group_settings().help_unaddressed  # noqa: SLF001
+        s = plugin._group_settings()  # noqa: SLF001
+        return s.help_unaddressed, s.help_unaddressed_delay_seconds
 
-    assert run(scenario()) is False
+    enabled, delay = run(scenario())
+    assert enabled is True
+    assert delay == 90
+
+
+def test_defer_schedules_watch_and_cancels_on_reply(loaded) -> None:
+    """观望期内有人接话 → 取消主动帮忙。
+
+    这是「等时间」的核心语义：不立即插话，给正在打字的人机会。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {
+            "enable": True,
+            "judge_all_messages": True,
+            "aggregate_window_seconds": 0,
+            "min_message_length": 1,
+            "help_unaddressed": True,
+            "help_unaddressed_delay_seconds": 30,
+        }
+        plugin = _isolated_plugin(loaded, config)
+
+        from betterchat_core import Action, GroupVerdict
+
+        async def fake_judge(*_a, **_k):
+            return GroupVerdict(Action.DEFER, "unanswered_question", 0.08, 0.94, 0.0)
+
+        plugin._judge_group = fake_judge  # noqa: SLF001
+
+        umo = "test:group:1"
+        # 第一条触发观望
+        await plugin.on_group_message(FakeEvent("有人知道这个报错吗", group=True))
+        task = plugin._help_tasks.get(umo)  # noqa: SLF001
+        assert task is not None, "应当登记观望任务"
+
+        # 第二条（有人接话）→ 观望任务被取消
+        await plugin.on_group_message(FakeEvent("我来答：是缺依赖", group=True))
+        assert task.cancelling() > 0, "有人接话时应当取消观望"
+
+        await plugin.terminate()
+        assert not plugin._help_tasks  # noqa: SLF001
+        return True
+
+    assert run(scenario()) is True
+
+
+def test_defer_not_scheduled_when_help_disabled(loaded) -> None:
+    """功能关闭时不该登记观望。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {
+            "enable": True,
+            "judge_all_messages": True,
+            "aggregate_window_seconds": 0,
+            "min_message_length": 1,
+            "help_unaddressed": False,
+        }
+        plugin = _isolated_plugin(loaded, config)
+
+        async def fake_judge(*_a, **_k):
+            # 关闭后走真实决策逻辑会返回 IGNORE
+            from betterchat_core import decide_group_action
+
+            return decide_group_action(
+                addressed=0.08,
+                open_question=0.94,
+                already_answered=0.0,
+                already_woken=False,
+                help_unaddressed=False,
+            )
+
+        plugin._judge_group = fake_judge  # noqa: SLF001
+        await plugin.on_group_message(FakeEvent("有人知道这个报错吗", group=True))
+        return plugin._help_tasks  # noqa: SLF001
+
+    assert run(scenario()) == {}
 
 
 # --------------------------------------------------------------------------- #

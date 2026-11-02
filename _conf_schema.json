@@ -155,8 +155,19 @@
       "help_unaddressed": {
         "type": "bool",
         "description": "主动帮「没人接的问题」",
-        "hint": "开启后，群里有人提了个还没人回答的问题时，即使没 @ Bot 也会插话。默认关闭 —— 群里两个人正常对话时「有人提问、还没人答」太常见，开启会让 Bot 见话就接。注意：@ 了别人的消息无论开关都不会抢答。",
-        "default": false
+        "hint": "开启后，群里有人提了个还没人回答的问题时，Bot 会先观望一段时间（见下一项），期间没人接才主动帮。默认开启 —— 但走观望，不会立即插话。注意：@ 了别人的消息无论开关都不会抢答。",
+        "default": true
+      },
+      "help_unaddressed_delay_seconds": {
+        "type": "int",
+        "description": "观望时长（秒）",
+        "hint": "发现问题没人接之后，等这么久还没人回答才主动帮。观望期内有人接话就自动取消。设为 0 表示不观望（立即帮，容易抢答）。",
+        "default": 90,
+        "slider": {
+          "min": 0,
+          "max": 600,
+          "step": 10
+        }
       },
       "aggregate_window_seconds": {
         "type": "float",

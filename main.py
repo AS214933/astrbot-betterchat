@@ -172,6 +172,8 @@ class BetterChatPlugin(Star):
         self.silence = SilenceTracker()
         #: 每群一个"冷场检查"定时任务，新消息来了就取消。
         self._silence_tasks: dict[str, asyncio.Task] = {}
+        #: 每群一个"观望待帮"的任务：有问题没人接时先等着，有人接话就取消。
+        self._help_tasks: dict[str, asyncio.Task] = {}
 
         self._log_startup()
 
@@ -521,9 +523,10 @@ class BetterChatPlugin(Star):
 
         # ---- 复读 / 冷场计时（都在判定之前） ----
 
-        # 有人说话了 → 记录沉默计时，并取消待执行的冷场发言。
+        # 有人说话了 → 记录沉默计时，并取消待执行的冷场发言 / 观望待帮。
         self.silence.note_message(umo)
         self._cancel_silence_task(umo)
+        self._cancel_help_task(umo)
 
         # 复读检测：命中则直接跟读并吞掉这条消息，不再走后续判定。
         reread_outcome = await self._try_reread(event, umo, settings)
@@ -590,6 +593,19 @@ class BetterChatPlugin(Star):
                     f"[BetterChat] 主动插话（{verdict.reason}）"
                     f" addressed={verdict.addressed} question={verdict.open_question}"
                 )
+            return
+
+        if verdict.action is Action.DEFER:
+            # 有个问题还没人接 —— 不立即插话（可能有人正在打字），
+            # 先观望一段时间；期间有人接话就取消。
+            self._take_over_turn(event)
+            event.is_at_or_wake_command = False
+            self._schedule_help(umo, settings, text)
+            logger.info(
+                f"[BetterChat] 观望中（{verdict.reason}）"
+                f" addressed={verdict.addressed} question={verdict.open_question}"
+                f" 等待 {settings.help_unaddressed_delay_seconds}s"
+            )
             return
 
         # 判定为不说话：禁止默认 LLM，并撤销主动权。
@@ -991,6 +1007,93 @@ class BetterChatPlugin(Star):
     # 防冷场
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    # 观望待帮：有问题但暂时没人接
+    # ------------------------------------------------------------------ #
+
+    def _cancel_help_task(self, umo: str) -> None:
+        task = self._help_tasks.pop(umo, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_help(
+        self, umo: str, settings: GroupSettings, question: str
+    ) -> None:
+        """登记一次「观望」，到期再看要不要帮。
+
+        为什么不是立即帮：群里两个人对话时「有人提问、还没人回答」是
+        最常见的状态 —— 对方可能正在打字。立即插话就是抢答，
+        等一个观望期才像真人。
+        """
+        delay = settings.help_unaddressed_delay_seconds
+        self._cancel_help_task(umo)
+        if delay <= 0:
+            # 不观望：交给下面的检查直接放行。
+            delay = 0.0
+        task = self.state.spawn(self._help_check(umo, settings, question, delay))
+        if task is not None:
+            self._help_tasks[umo] = task
+
+    async def _help_check(
+        self,
+        umo: str,
+        settings: GroupSettings,
+        question: str,
+        delay: float,
+    ) -> None:
+        """观望期满后，确认确实没人接，再主动帮一次。"""
+        import datetime
+
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            # 观望期内有人说话 → 说明话题还在继续，不插嘴。
+            silence = self.silence.silence_seconds(umo)
+            if silence < max(delay, 1.0):
+                logger.debug(
+                    f"[BetterChat] 观望取消：有人接话了（安静 {silence:.0f}s）"
+                )
+                return
+
+            # 走和其他主动发言一样的本地闸门。
+            today = datetime.date.today().isoformat()
+            state = self.silence.group(umo)
+            action, reason = proactive_gate(
+                settings=self._proactive_settings(),
+                silence_seconds=silence,
+                seconds_since_bot=self.silence.seconds_since_bot(umo),
+                proactive_today=self.silence.proactive_count(umo, day_stamp=today),
+                message_count=state.message_count,
+                hour_of_day=datetime.datetime.now().hour,
+            )
+            if action is not ProactiveAction.SPEAK:
+                logger.debug(f"[BetterChat] 观望到期但闸门拦截（{reason}）")
+                return
+
+            logger.info("[BetterChat] 观望期满，主动帮忙回答问题")
+            await self._speak_proactively(
+                umo,
+                event=None,
+                prompt=(
+                    f"（群里有人提了个问题，等了 {delay:.0f} 秒都没人回答："
+                    f"{question[:200]}　你可以自然地帮着答一句，"
+                    "就像群友随口接话那种。直接说答案就好，"
+                    "不要复述这条说明，也不要解释你在做什么。"
+                    "如果确实答不上来，就只回一个句号。）"
+                ),
+            )
+            self.silence.bump_proactive(umo, day_stamp=today)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 观望失败绝不能影响聊天
+            logger.warning("[BetterChat] 观望待帮异常", exc_info=True)
+
+    # ------------------------------------------------------------------ #
+    # 防冷场
+    # ------------------------------------------------------------------ #
+
     def _cancel_silence_task(self, umo: str) -> None:
         task = self._silence_tasks.pop(umo, None)
         if task is not None and not task.done():
@@ -1114,13 +1217,22 @@ class BetterChatPlugin(Star):
         return ""
 
     async def _speak_proactively(
-        self, umo: str, event: AstrMessageEvent
+        self,
+        umo: str,
+        event: AstrMessageEvent | None = None,
+        *,
+        prompt: str | None = None,
     ) -> None:
         """主动开口：注入一个官方 CronMessageEvent，让主 LLM 正常生成。
 
         为什么不用 ``provider.text_chat`` 直接调模型：那样会绕过整个管线，
         人设、长期记忆、工具、发送钩子全部失效，发出来的话会很不像这个 Bot。
         走官方事件队列则完全等价于"有人在说话"，只不过说话者是定时任务。
+
+        Args:
+            umo: 会话标识。
+            event: 触发本次发言的事件；冷场/观望场景没有对应事件，传 ``None``。
+            prompt: 自定义提示。不传则用「冷场暖场」的默认措辞。
         """
         try:
             from astrbot.core.cron.events import CronMessageEvent
@@ -1142,12 +1254,13 @@ class BetterChatPlugin(Star):
         # * 明确说"不要复述这段说明"，堵住自我解释。
         # * 给一个真正的"退出选项"（只回句号），否则模型没什么可说时
         #   会硬憋一句废话。
-        prompt = (
-            "（群聊已经安静了一段时间，你可以自在地说一句话暖场，"
-            "就像群友随口说的那种。直接说你想到的话就好，"
-            "不要复述这条说明，也不要解释你在做什么。"
-            "如果实在没什么想说的，就只回一个句号。）"
-        )
+        if prompt is None:
+            prompt = (
+                "（群聊已经安静了一段时间，你可以自在地说一句话暖场，"
+                "就像群友随口说的那种。直接说你想到的话就好，"
+                "不要复述这条说明，也不要解释你在做什么。"
+                "如果实在没什么想说的，就只回一个句号。）"
+            )
         try:
             synthetic = CronMessageEvent(
                 context=self.context,
@@ -1397,6 +1510,8 @@ class BetterChatPlugin(Star):
         """
         for umo in list(self._silence_tasks):
             self._cancel_silence_task(umo)
+        for umo in list(self._help_tasks):
+            self._cancel_help_task(umo)
         try:
             await self.group_agg.close()
         except Exception:  # noqa: BLE001

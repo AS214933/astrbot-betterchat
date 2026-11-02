@@ -15,6 +15,38 @@
 
 ---
 
+## [1.5.0] - 2026-11-02
+
+### 变更
+
+- **「主动帮没人接的问题」由「立即帮」改为「观望后再帮」**。
+
+  1.4.2 里这条规则被直接关掉了，因为立即插话会和正在打字的人撞车 ——
+  群里两个人正常对话时「有人提问、还没人回答」是最常见的状态。
+
+  现在改成观望：
+
+  ```
+  发现问题没人接
+      ↓
+  观望 N 秒（默认 90）      ← 期间有人接话就取消
+      ↓
+  仍然没人答 → 主动帮一句
+  ```
+
+  新增配置 `group.help_unaddressed_delay_seconds`（默认 90 秒，0 表示不观望）。
+  `group.help_unaddressed` 恢复默认开启 —— 能力保留，只是不再莽撞。
+
+- 判定新增 `DEFER` 动作：表示「现在不该插话，但值得等一会儿」。
+  与 `IGNORE` 的区别是它会在观望期满后触发一次主动发言。
+
+### 说明
+
+- 观望期满后仍会走完整的本地闸门（免打扰 / 每日上限 / Bot 冷却），
+  不是无条件发言。
+
+---
+
 ## [1.4.2] - 2026-11-02
 
 ### 修复
@@ -335,7 +367,8 @@
 
 ---
 
-[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.2...HEAD
+[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.2...v1.5.0
 [1.4.2]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/AS214933/astrbot-betterchat/compare/v1.3.1...v1.4.0

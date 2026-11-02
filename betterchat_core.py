@@ -588,12 +588,16 @@ class GroupSettings:
     min_interval_seconds: int = 120
     bot_cooldown_seconds: int = 90
     context_messages: int = 10
-    help_unaddressed: bool = False
+    help_unaddressed: bool = True
     """没被叫到时，是否主动帮「没人接的问题」。
 
-    默认关闭。这条规则最容易显得 Bot 在多管闲事 —— 群里两个人正常对话时
-    「有人提问、还没人回答」是极常见的状态，放行就等于见缝插针。
+    注意：不是**立即**帮，而是先进入观望期（见
+    :attr:`help_unaddressed_delay_seconds`）。群里两个人正常对话时
+    「有人提问、还没人回答」极常见，立即插话就是抢答；
+    等一会儿没人接再说，才像真人。
     """
+    help_unaddressed_delay_seconds: int = 90
+    """观望多久还没人接，才主动帮。0 表示不观望（立即帮）。"""
     aggregate_window_seconds: float = 1.5
     """判定前的静默聚合窗口（秒）。0 表示每条消息各判一次。"""
     fail_policy: str = "closed"
@@ -618,7 +622,10 @@ class GroupSettings:
                 0, _as_int(section.get("bot_cooldown_seconds", 90), 90)
             ),
             context_messages=max(0, _as_int(section.get("context_messages", 10), 10)),
-            help_unaddressed=bool(section.get("help_unaddressed", False)),
+            help_unaddressed=bool(section.get("help_unaddressed", True)),
+            help_unaddressed_delay_seconds=max(
+                0, _as_int(section.get("help_unaddressed_delay_seconds", 90), 90)
+            ),
             aggregate_window_seconds=max(
                 0.0, min(10.0, _as_float(section.get("aggregate_window_seconds", 1.5), 1.5))
             ),
@@ -704,6 +711,12 @@ class Action(str, Enum):
 
     RESPOND = "respond"
     IGNORE = "ignore"
+    DEFER = "defer"
+    """现在不该插话，但值得等一会儿 —— 如果没人接，再主动帮。
+
+    用于「有问题还没人回答」的场景：立即插话会和正在打字的人撞车，
+    等一段观望期更自然；观望期内有人回答了就不必再开口。
+    """
     UNKNOWN = "unknown"
     """Jev 不可用 / 返回不合法 —— 交给失败策略决定。"""
 
@@ -726,7 +739,7 @@ def decide_group_action(
     already_answered: float | None,
     already_woken: bool,
     addressed_to_other: bool = False,
-    help_unaddressed: bool = False,
+    help_unaddressed: bool = True,
     reply_threshold: float = 0.7,
     already_answered_threshold: float = 0.7,
 ) -> GroupVerdict:
@@ -782,8 +795,9 @@ def decide_group_action(
         # Bot 插进去就是抢答。这一条是实测踩出来的：state 里没标"@了别人"，
         # Jev 只看到"有人提问"，于是把一对一对话也当成求助。
         if not addressed_to_other:
+            # 不立即插话，先观望 —— 可能有人正在打字要回答。
             return GroupVerdict(
-                Action.RESPOND,
+                Action.DEFER,
                 "unanswered_question",
                 addressed,
                 open_question,

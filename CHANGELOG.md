@@ -15,6 +15,37 @@
 
 ---
 
+## [1.4.1] - 2026-11-02
+
+### 修复
+
+- **@ 了别人的消息会被抢答**（关键）。群里 A 问 B「你这是哪个大学的」时，
+  从 Jev 的角度看就是「有人提问、没人回答」—— `open_question=0.95`、
+  `addressed=0.06`，正好命中「主动帮一把」规则，Bot 便插进了两人之间的对话。
+
+  根因：`state` 里只标了「有没有 @ Bot」，**没标「有没有 @ 别人」**。
+  Jev 无从知道那是定向提问还是公开求助。
+
+  修复分两层：
+  - `state.bot` 新增 `addressed_to_other` 字段（平台层面已确定的事实）；
+  - 「主动帮一把」规则加上前置条件：@ 了别人时不抢答。
+    被 @ 的消息不受影响 —— 用户明确叫了 Bot 就该回。
+
+- **主动开口时把"写作要求"复述进回复**。实测模型会发出这样的内容：
+
+  > ...点出群名缩写就行。简短自然。
+
+  「简短自然」是给模型的要求，却被当成正文吐了出来。原因是 prompt 写成了
+  「要求：1. 2. 3.」的清单式，模型把它当成"我该怎么做"的说明。
+  改为直接陈述 + 明确要求不复述、不解释，并给一个真正的退出选项。
+
+### 说明
+
+- 日志中同一行重复三次（含 `[Core]` 的事件总线、follow_up、工具调用日志）
+  是 AstrBot 日志层或运行多份实例的表现，与本插件无关。
+
+---
+
 ## [1.4.0] - 2026-11-02
 
 ### 新增
@@ -269,7 +300,8 @@
 
 ---
 
-[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.0...HEAD
+[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/AS214933/astrbot-betterchat/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/AS214933/astrbot-betterchat/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/AS214933/astrbot-betterchat/compare/v1.2.0...v1.3.0

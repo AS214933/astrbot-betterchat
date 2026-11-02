@@ -843,7 +843,11 @@ def test_state_carries_bot_identity() -> None:
         latest_sender="someone",
         bot_mentioned=True,
     )
-    assert state["bot"] == {"name": "HexVergeBot", "mentioned_in_latest": True}
+    assert state["bot"] == {
+        "name": "HexVergeBot",
+        "mentioned_in_latest": True,
+        "addressed_to_other": False,
+    }
     assert state["latest_message"]["sender"] == "someone"
     assert state["latest_message"]["text"] == "hi"
 

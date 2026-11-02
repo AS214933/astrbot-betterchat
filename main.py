@@ -682,6 +682,8 @@ class BetterChatPlugin(Star):
             open_question=answers["open_question"].value,
             already_answered=answers["already_answered_by_bot"].value,
             already_woken=already_woken,
+            # @ 了别人 → 不抢答两人之间的对话。
+            addressed_to_other=self.at_other(event),
             reply_threshold=jev_config.reply_threshold,
             already_answered_threshold=jev_config.already_answered_threshold,
         )
@@ -689,6 +691,31 @@ class BetterChatPlugin(Star):
     # ------------------------------------------------------------------ #
     # 事件信息提取
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def at_other(event: AstrMessageEvent) -> bool:
+        """这条消息是否 @ 了**别人**（不是 Bot）。
+
+        为什么必须单独判断：群里 A 问 B「你这是哪个大学的」，从 Jev 的角度看
+        就是个「有人提问、没人回答」的场景，open_question 会很高。如果不知道
+        那是两人之间的对话，Bot 就会抢答 —— 实测踩过这个坑。
+
+        平台层面已经确定了这个事实（At 组件的 qq 字段），比让模型从文本里
+        猜 "@xxx" 是不是自己可靠得多。
+        """
+        self_id = str(event.get_self_id() or "")
+        try:
+            for comp in event.get_messages():
+                kind = getattr(comp, "type", None)
+                if str(getattr(kind, "value", kind)) != "At":
+                    continue
+                target = str(getattr(comp, "qq", "") or "")
+                if not target or target in (self_id, "all"):
+                    continue
+                return True
+        except Exception:  # noqa: BLE001 - 消息链结构异常时保守处理
+            return False
+        return False
 
     @staticmethod
     def _is_self_message(event: AstrMessageEvent) -> bool:
@@ -739,6 +766,8 @@ class BetterChatPlugin(Star):
             "bot_name": self._bot_name(event),
             "latest_sender": self._sender_name(event),
             "bot_mentioned": bool(already_woken),
+            # 「@ 了别人」也是平台层面的事实，必须一起给 Jev。
+            "addressed_to_other": self.at_other(event),
             # 平台给了创建时间就带上"多久以前"：Jev 能据此区分
             # "刚刚正在聊" 和 "5 分钟前没人接的老问题"。
             "latest_seconds_ago": self._seconds_since_created(event),
@@ -1069,11 +1098,18 @@ class BetterChatPlugin(Star):
             logger.warning(f"[BetterChat] 无法解析会话标识：{umo}")
             return
 
+        # 这段 prompt 会被当成"用户消息"送进主 LLM，所以措辞要小心：
+        #
+        # * 不要写成"要求：1. 2. 3."这种清单 —— 实测模型会把清单本身
+        #   当成"我该怎么做"的说明，然后原样吐进回复里。
+        # * 明确说"不要复述这段说明"，堵住自我解释。
+        # * 给一个真正的"退出选项"（只回句号），否则模型没什么可说时
+        #   会硬憋一句废话。
         prompt = (
-            "群聊已经安静了一段时间，你可以自然地开口说一句话。"
-            "要求：结合最近的聊天内容，简短、口语化、像群友随口说的；"
-            "不要生硬地开启新话题，不要长篇大论，不要提到自己是程序。"
-            "如果确实没什么可说的，就只回一个句号。"
+            "（群聊已经安静了一段时间，你可以自在地说一句话暖场，"
+            "就像群友随口说的那种。直接说你想到的话就好，"
+            "不要复述这条说明，也不要解释你在做什么。"
+            "如果实在没什么想说的，就只回一个句号。）"
         )
         try:
             synthetic = CronMessageEvent(

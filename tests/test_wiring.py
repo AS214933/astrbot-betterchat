@@ -45,6 +45,8 @@ class _ComponentType(str, enum.Enum):
     Plain = "Plain"
     Image = "Image"
     Reply = "Reply"
+    At = "At"
+    AtAll = "AtAll"
 
 
 class _Plain:
@@ -61,6 +63,15 @@ class _Image:
 
     def __init__(self, url: str = "x") -> None:
         self.url = url
+
+
+class _At:
+    """对应 ``astrbot.core.message.components.At``（带 qq 字段）。"""
+
+    type = _ComponentType.At
+
+    def __init__(self, qq: str) -> None:
+        self.qq = qq
 
 
 class _Logger:
@@ -172,6 +183,11 @@ class FakeEvent:
 
     def get_group_id(self) -> str:
         return "g1" if self._group else ""
+
+    def get_messages(self):
+        """对应 AstrMessageEvent.get_messages()。"""
+        chain = getattr(self.message_obj, "message", None)
+        return list(chain) if isinstance(chain, list) else []
 
     def is_admin(self) -> bool:
         return False
@@ -1041,6 +1057,69 @@ def test_proactive_state_carries_silence_facts(loaded) -> None:
     assert "silence_seconds" in state
     assert "seconds_since_bot_spoke" in state
     assert "recent_messages" in state
+
+
+def test_at_other_detects_mention_of_someone_else(loaded) -> None:
+    """「@ 了别人」必须能检测出来 —— 这是不抢答的前提。
+
+    AstrBot 的 At 组件带 ``qq`` 字段，平台层面就已经确定了 @ 的是谁，
+    比让模型从文本里猜靠谱。
+    """
+
+    At = _At
+
+    def make(chain):
+        event = FakeEvent("x", group=True)
+        event.message_obj.message = chain
+        return event
+
+    # @ 别人 → True
+    assert loaded.module.BetterChatPlugin.at_other(make([At("other-id")])) is True
+    # @ 自己 → False
+    assert loaded.module.BetterChatPlugin.at_other(make([At("bot")])) is False
+    # @全体 → False
+    assert loaded.module.BetterChatPlugin.at_other(make([At("all")])) is False
+    # 没有 At → False
+    assert loaded.module.BetterChatPlugin.at_other(make([_Plain("hi")])) is False
+
+
+def test_group_gate_ignores_message_addressed_to_other(loaded) -> None:
+    """端到端：@ 了别人的提问不该触发主动插话。"""
+
+    At = _At
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {
+            "enable": True,
+            "judge_all_messages": True,
+            "aggregate_window_seconds": 0,
+            "min_message_length": 1,
+        }
+        plugin = _isolated_plugin(loaded, config)
+
+        async def fake_judge(event, umo, settings, text, already_woken):
+            # 走真实的决策逻辑，验证 addressed_to_other 确实传下去了
+            from betterchat_core import decide_group_action
+
+            return decide_group_action(
+                addressed=0.06,
+                open_question=0.95,
+                already_answered=0.0,
+                already_woken=already_woken,
+                addressed_to_other=plugin.at_other(event),
+            )
+
+        plugin._judge_group = fake_judge  # noqa: SLF001
+
+        event = FakeEvent("@某人 你这是哪个大学的", group=True)
+        event.message_obj.message = [At("someone-else"), _Plain("你这是哪个大学的")]
+        await plugin.on_group_message(event)
+        return event
+
+    event = run(scenario())
+    # 判定为不说话 → call_llm=True（禁止默认 LLM）
+    assert event.call_llm is True, "@ 了别人的对话不该被插话"
 
 
 # --------------------------------------------------------------------------- #

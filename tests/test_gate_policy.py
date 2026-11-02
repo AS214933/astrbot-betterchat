@@ -271,3 +271,48 @@ def test_woken_always_responds_even_on_failure(policy: str) -> None:
 
 def test_unknown_policy_falls_back_to_closed() -> None:
     assert resolve_fail_policy("banana", already_woken=False) is Action.IGNORE
+
+
+# --------------------------------------------------------------------------- #
+# @ 了别人 —— 不抢答
+# --------------------------------------------------------------------------- #
+
+
+def test_does_not_answer_when_addressed_to_someone_else() -> None:
+    """回归测试：@ 了别人的提问，不该被当成"没人接的问题"抢答。
+
+    实测踩过：群里 A 问 B「你这是哪个大学的」，open_question=0.95、
+    addressed=0.06，命中「主动帮一把」规则，Bot 就把两人之间的对话
+    当成求助插了进去。
+    """
+    verdict = decide(
+        addressed=0.06,
+        open_question=0.95,
+        already_answered=0.0,
+        addressed_to_other=True,
+    )
+    assert verdict.action is Action.IGNORE
+
+
+def test_still_helps_when_no_specific_target() -> None:
+    """没 @ 任何人的提问，仍然主动帮。"""
+    verdict = decide(
+        addressed=0.06,
+        open_question=0.95,
+        already_answered=0.0,
+        addressed_to_other=False,
+    )
+    assert verdict.action is Action.RESPOND
+    assert verdict.reason == "unanswered_question"
+
+
+def test_addressed_to_other_does_not_block_direct_call() -> None:
+    """被 @ 了就算同时 @ 了别人，也照样回 —— 用户明确叫了 Bot。"""
+    verdict = decide(
+        addressed=0.9,
+        open_question=0.9,
+        already_answered=0.0,
+        already_woken=True,
+        addressed_to_other=True,
+    )
+    assert verdict.action is Action.RESPOND

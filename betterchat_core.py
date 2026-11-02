@@ -718,6 +718,7 @@ def decide_group_action(
     open_question: float | None,
     already_answered: float | None,
     already_woken: bool,
+    addressed_to_other: bool = False,
     reply_threshold: float = 0.7,
     already_answered_threshold: float = 0.7,
 ) -> GroupVerdict:
@@ -767,13 +768,19 @@ def decide_group_action(
 
     if open_question >= 0.85 and addressed <= 0.3:
         # 群里有人提了个没人接的问题 —— 主动帮一把。
-        return GroupVerdict(
-            Action.RESPOND,
-            "unanswered_question",
-            addressed,
-            open_question,
-            already_answered,
-        )
+        #
+        # 但**必须排除"在问某个具体的人"的情况**。群里 A 问 B「你这是哪个
+        # 大学的」时，open_question 同样很高，可那是两人之间的对话，
+        # Bot 插进去就是抢答。这一条是实测踩出来的：state 里没标"@了别人"，
+        # Jev 只看到"有人提问"，于是把一对一对话也当成求助。
+        if not addressed_to_other:
+            return GroupVerdict(
+                Action.RESPOND,
+                "unanswered_question",
+                addressed,
+                open_question,
+                already_answered,
+            )
 
     return GroupVerdict(
         Action.IGNORE, "not_addressed", addressed, open_question, already_answered
@@ -839,6 +846,7 @@ def build_gate_state(
     bot_name: str = "",
     latest_sender: str = "",
     bot_mentioned: bool = False,
+    addressed_to_other: bool = False,
     latest_seconds_ago: float | None = None,
     max_chars: int = 6000,
 ) -> dict[str, object]:
@@ -886,6 +894,10 @@ def build_gate_state(
         "bot": {
             "name": clip(bot_name, 80) if bot_name else "",
             "mentioned_in_latest": bool(bot_mentioned),
+            # 「这条消息 @ 了别人」是平台层面已经确定的事实，必须显式给出。
+            # 少了它，Jev 只会看到「有人在提问」而不知道那是在问别人 ——
+            # 结果就是 Bot 抢答两人之间的对话。
+            "addressed_to_other": bool(addressed_to_other),
         },
         "latest_message": latest_payload,
         "recent_messages": [

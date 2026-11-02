@@ -907,6 +907,142 @@ def test_context_survives_gate_rejection(loaded) -> None:
     assert [c.text for c in recorded] == ["短消息"]
 
 
+def test_reread_triggers_and_swallows_message(loaded) -> None:
+    """复读命中后：转发原消息 + 吞掉这条，不再走唤醒判定。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {"enable": True, "judge_all_messages": True, "aggregate_window_seconds": 0, "min_message_length": 1}
+        config["reread"] = {
+            "enable": True,
+            "text_threshold": 3,
+            "follow_probability": 1.0,  # 必定跟读
+            "cooldown_seconds": 0,
+            "max_per_hour": 0,
+        }
+        plugin = _isolated_plugin(loaded, config)
+
+        events = []
+        for i, sender in enumerate(["u1", "u2", "u3"]):
+            event = FakeEvent("哈哈哈", group=True)
+            event.message_obj.message = [_Plain("哈哈哈")]
+            event.message_obj.message_id = f"m{i}"
+            event.get_sender_id = lambda s=sender: s  # type: ignore[method-assign]
+            events.append(event)
+
+        # 前两条不触发，第三条触发
+        for event in events:
+            await plugin.on_group_message(event)
+
+        # 检查是否有事件被 send 过（复读发送）
+        return events
+
+    events = run(scenario())
+    # 第三条触发复读：它应该被 take over（call_llm=True），不继续走判定
+    assert events[-1].call_llm is True
+
+
+def test_reread_disabled_by_default(loaded) -> None:
+    """默认关闭 —— 不应有任何复读行为。"""
+
+    async def scenario():
+        plugin = _isolated_plugin(loaded, FakeConfig(base_config()))
+        return plugin._reread_settings().enable  # noqa: SLF001
+
+    assert run(scenario()) is False
+
+
+def test_reread_ignores_commands(loaded) -> None:
+    """指令不参与复读。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {"enable": True, "judge_all_messages": True, "aggregate_window_seconds": 0, "min_message_length": 1}
+        config["reread"] = {"enable": True, "text_threshold": 2, "follow_probability": 1.0, "cooldown_seconds": 0, "max_per_hour": 0}
+        plugin = _isolated_plugin(loaded, config)
+        results = []
+        for i, sender in enumerate(["u1", "u2"]):
+            event = FakeEvent("/help", group=True)
+            event.message_obj.message = [_Plain("/help")]
+            event.message_obj.message_id = f"c{i}"
+            event.get_sender_id = lambda s=sender: s  # type: ignore[method-assign]
+            results.append(await plugin._try_reread(event, "test:group:1", plugin._group_settings()))  # noqa: SLF001
+        return results
+
+    assert run(scenario()) == [None, None]
+
+
+def test_proactive_disabled_by_default(loaded) -> None:
+    async def scenario():
+        plugin = _isolated_plugin(loaded, FakeConfig(base_config()))
+        return plugin._proactive_settings().enable  # noqa: SLF001
+
+    assert run(scenario()) is False
+
+
+def test_proactive_schedules_and_cancels_on_new_message(loaded) -> None:
+    """有人说话 → 安排冷场检查；再来消息 → 取消重排。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["group"] = {"enable": True, "judge_all_messages": True, "aggregate_window_seconds": 0, "min_message_length": 1}
+        config["proactive"] = {"enable": True, "silence_seconds": 600}
+        plugin = _isolated_plugin(loaded, config)
+        umo = "test:group:1"
+
+        await plugin.on_group_message(FakeEvent("第一句够长了", group=True))
+        first = plugin._silence_tasks.get(umo)  # noqa: SLF001
+        assert first is not None, "应当安排了冷场检查"
+
+        await plugin.on_group_message(FakeEvent("第二句够长了", group=True))
+        second = plugin._silence_tasks.get(umo)  # noqa: SLF001
+        assert second is not None
+        assert second is not first, "新消息应当重排"
+        # cancel 是"已请求"，任务要在下一个 check point 才真正结束。
+        assert first.cancelling() > 0, "旧任务应被请求取消"
+
+        await plugin.terminate()
+        assert not plugin._silence_tasks  # noqa: SLF001
+        return True
+
+    assert run(scenario()) is True
+
+
+def test_proactive_gate_respects_quiet_hours(loaded) -> None:
+    """免打扰时段不开口。"""
+    from betterchat_group_extras import ProactiveAction, ProactiveSettings, proactive_gate
+
+    action, reason = proactive_gate(
+        settings=ProactiveSettings(enable=True, quiet_hours="23-7"),
+        silence_seconds=9999,
+        seconds_since_bot=float("inf"),
+        proactive_today=0,
+        message_count=10,
+        hour_of_day=3,
+    )
+    assert action is ProactiveAction.SKIP
+    assert reason == "quiet_hours"
+
+
+def test_proactive_state_carries_silence_facts(loaded) -> None:
+    """冷场 state 必须带上"安静多久"这类事实。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["proactive"] = {"enable": True, "silence_seconds": 600}
+        plugin = _isolated_plugin(loaded, config)
+        umo = "test:group:1"
+        plugin.silence.note_message(umo, now=1000.0)
+        plugin.silence.note_message(umo, now=1010.0)
+        state = plugin._proactive_state(umo, plugin._proactive_settings())  # noqa: SLF001
+        return state
+
+    state = run(scenario())
+    assert "silence_seconds" in state
+    assert "seconds_since_bot_spoke" in state
+    assert "recent_messages" in state
+
+
 # --------------------------------------------------------------------------- #
 # 生命周期
 # --------------------------------------------------------------------------- #

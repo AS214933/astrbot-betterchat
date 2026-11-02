@@ -388,5 +388,173 @@
         }
       }
     }
+  },
+  "reread": {
+    "type": "object",
+    "description": "自动复读",
+    "hint": "群里出现重复消息时，Bot 跟着复读一份。复读是直接转发原消息，不经过模型 —— 那样才像复读。",
+    "items": {
+      "enable": {
+        "type": "bool",
+        "description": "启用自动复读",
+        "hint": "默认关闭。开启后群里连续出现相同消息时 Bot 会跟一句。",
+        "default": false
+      },
+      "text_threshold": {
+        "type": "int",
+        "description": "文字复读阈值（条）",
+        "hint": "连续多少条相同文字才算复读。必须是不同的人发的 —— 同一个人刷屏不算。",
+        "default": 4,
+        "slider": {
+          "min": 2,
+          "max": 10,
+          "step": 1
+        }
+      },
+      "image_threshold": {
+        "type": "int",
+        "description": "图片复读阈值（条）",
+        "hint": "连续多少张相同图片才算复读。",
+        "default": 3,
+        "slider": {
+          "min": 2,
+          "max": 10,
+          "step": 1
+        }
+      },
+      "face_threshold": {
+        "type": "int",
+        "description": "表情复读阈值（条）",
+        "hint": "连续多少个相同表情才算复读。表情比较容易撞，所以默认最低。",
+        "default": 2,
+        "slider": {
+          "min": 2,
+          "max": 10,
+          "step": 1
+        }
+      },
+      "follow_probability": {
+        "type": "float",
+        "description": "跟读概率",
+        "hint": "判定为复读后，实际跟读的概率。留一点不跟的余地，避免显得有求必应。",
+        "default": 0.8,
+        "slider": {
+          "min": 0,
+          "max": 1,
+          "step": 0.05
+        }
+      },
+      "cooldown_seconds": {
+        "type": "int",
+        "description": "两次跟读最小间隔（秒）",
+        "hint": "防止连续跟读刷屏。0 表示不限制。",
+        "default": 300,
+        "slider": {
+          "min": 0,
+          "max": 3600,
+          "step": 30
+        }
+      },
+      "max_per_hour": {
+        "type": "int",
+        "description": "每小时最多跟读次数",
+        "hint": "每个群每小时的上限。0 表示不限制。",
+        "default": 6,
+        "slider": {
+          "min": 0,
+          "max": 60,
+          "step": 1
+        }
+      },
+      "ignore_prefixes": {
+        "type": "list",
+        "description": "不参与复读的前缀",
+        "hint": "以这些符号开头的消息（指令）不参与复读判定。",
+        "default": [
+          "/",
+          "!"
+        ]
+      }
+    }
+  },
+  "proactive": {
+    "type": "object",
+    "description": "防冷场",
+    "hint": "群聊长时间没人说话时，Bot 主动开口暖场。会先过本地闸门，再让 Jev 判断这时开口合不合适。",
+    "items": {
+      "enable": {
+        "type": "bool",
+        "description": "启用防冷场",
+        "hint": "默认关闭。这是最容易显得打扰的功能，建议先观察一段时间再开。",
+        "default": false
+      },
+      "silence_seconds": {
+        "type": "int",
+        "description": "冷场判定时长（秒）",
+        "hint": "群安静满这么久才考虑主动开口。默认 1200 秒 = 20 分钟。",
+        "default": 1200,
+        "slider": {
+          "min": 300,
+          "max": 7200,
+          "step": 60
+        }
+      },
+      "require_prior_activity": {
+        "type": "bool",
+        "description": "需要群里有历史活跃",
+        "hint": "强烈建议开启。否则刚把 Bot 拉进群它就会自言自语。",
+        "default": true
+      },
+      "min_messages_before": {
+        "type": "int",
+        "description": "至少多少条消息后才允许开口",
+        "hint": "配合上一项使用，保证这个群曾经热闹过。",
+        "default": 3,
+        "slider": {
+          "min": 0,
+          "max": 50,
+          "step": 1
+        }
+      },
+      "quiet_hours": {
+        "type": "string",
+        "description": "免打扰时段",
+        "hint": "24 小时制，格式「开始-结束」，如 23-7 表示 23 点到次日 7 点。结束时间不含。留空表示不限制。跨午夜会正确处理。",
+        "default": "23-7"
+      },
+      "max_per_day": {
+        "type": "int",
+        "description": "每天最多主动开口次数",
+        "hint": "每个群独立计数，跨天自动清零。0 表示不限制。",
+        "default": 3,
+        "slider": {
+          "min": 0,
+          "max": 20,
+          "step": 1
+        }
+      },
+      "bot_cooldown_seconds": {
+        "type": "int",
+        "description": "Bot 发言后冷却（秒）",
+        "hint": "Bot 刚说过话时不主动开口，避免自说自话。",
+        "default": 1800,
+        "slider": {
+          "min": 0,
+          "max": 7200,
+          "step": 60
+        }
+      },
+      "context_messages": {
+        "type": "int",
+        "description": "带给 Jev 的消息条数",
+        "hint": "判定时说「最近都聊了什么」需要看多少条。",
+        "default": 10,
+        "slider": {
+          "min": 1,
+          "max": 30,
+          "step": 1
+        }
+      }
+    }
   }
 }

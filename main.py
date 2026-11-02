@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 try:  # 包内导入（AstrBot 正常加载方式）
@@ -42,7 +43,20 @@ try:  # 包内导入（AstrBot 正常加载方式）
         JevClient,
         JevConfig,
         JevError,
+        NoulQuestion,
         build_group_questions,
+    )
+    from .betterchat_group_extras import (
+        ProactiveAction,
+        ProactiveSettings,
+        RereadDetector,
+        RereadSettings,
+        RereadVerdict,
+        SilenceTracker,
+        build_proactive_questions,
+        make_fingerprint,
+        proactive_gate,
+        reread_gate,
     )
     from .betterchat_state import RateLimiter, RuntimeState, TranscriptCache
 except ImportError:  # 直接以路径加载时的兜底
@@ -61,7 +75,25 @@ except ImportError:  # 直接以路径加载时的兜底
         merge_group_lines,
         resolve_fail_policy,
     )
-    from betterchat_jev import JevClient, JevConfig, JevError, build_group_questions
+    from betterchat_jev import (
+        JevClient,
+        JevConfig,
+        JevError,
+        NoulQuestion,
+        build_group_questions,
+    )
+    from betterchat_group_extras import (
+        ProactiveAction,
+        ProactiveSettings,
+        RereadDetector,
+        RereadSettings,
+        RereadVerdict,
+        SilenceTracker,
+        build_proactive_questions,
+        make_fingerprint,
+        proactive_gate,
+        reread_gate,
+    )
     from betterchat_state import RateLimiter, RuntimeState, TranscriptCache
 
 from astrbot.api import AstrBotConfig, logger
@@ -118,6 +150,13 @@ class BetterChatPlugin(Star):
         #: 聚合时收集到的其他消息，送去判定后即清空。
         self._pending_group_context: dict[str, list] = {}
 
+        # ---- 自动复读 / 防冷场 ----
+        self.transcripts = self.transcripts  # 复用上面的上下文缓存
+        self._reread_detectors: dict[str, RereadDetector] = {}
+        self.silence = SilenceTracker()
+        #: 每群一个"冷场检查"定时任务，新消息来了就取消。
+        self._silence_tasks: dict[str, asyncio.Task] = {}
+
         self._log_startup()
 
     # ------------------------------------------------------------------ #
@@ -143,6 +182,12 @@ class BetterChatPlugin(Star):
 
     def _group_settings(self) -> GroupSettings:
         return GroupSettings.from_config(self._section("group"))
+
+    def _reread_settings(self) -> RereadSettings:
+        return RereadSettings.from_config(self._section("reread"))
+
+    def _proactive_settings(self) -> ProactiveSettings:
+        return ProactiveSettings.from_config(self._section("proactive"))
 
     def _jev_config(self) -> JevConfig:
         return JevConfig.from_config(self._section("jev"))
@@ -457,6 +502,21 @@ class BetterChatPlugin(Star):
 
         if self._is_self_message(event):
             return
+
+        # ---- 复读 / 冷场计时（都在判定之前） ----
+
+        # 有人说话了 → 记录沉默计时，并取消待执行的冷场发言。
+        self.silence.note_message(umo)
+        self._cancel_silence_task(umo)
+
+        # 复读检测：命中则直接跟读并吞掉这条消息，不再走后续判定。
+        reread_outcome = await self._try_reread(event, umo, settings)
+        if reread_outcome is not None:
+            return
+
+        # 安排下一次冷场检查（有人说话就把计时重置）。
+        self._schedule_silence_check(umo, event)
+
         already_woken = bool(getattr(event, "is_at_or_wake_command", False))
 
         decision = gate_reason(
@@ -774,6 +834,265 @@ class BetterChatPlugin(Star):
         # 没有"最近 N 条"这种东西）。
         return self.transcripts.recent(event.unified_msg_origin, limit)
 
+    # ------------------------------------------------------------------ #
+    # 自动复读
+    # ------------------------------------------------------------------ #
+
+    def _reread_detector(self, umo: str) -> RereadDetector:
+        det = self._reread_detectors.get(umo)
+        if det is None:
+            det = RereadDetector()
+            self._reread_detectors[umo] = det
+        return det
+
+    async def _try_reread(
+        self, event: AstrMessageEvent, umo: str, settings: GroupSettings
+    ) -> RereadVerdict | None:
+        """复读检测与跟读。
+
+        Returns:
+            ``None`` 表示不是复读，调用方继续正常流程；
+            返回任何 :class:`RereadVerdict` 都表示**已处理完毕，调用方应直接返回**
+            （即使这次没跟读，也要把消息吞掉 —— 已经确认是复读场景了，
+            再让它触发一次 LLM 回复会很怪）。
+        """
+        import random
+
+        cfg = self._reread_settings()
+        if not cfg.enable:
+            return None
+
+        text = (event.message_str or "").strip()
+        # 指令不参与复读。
+        if text and any(text.lstrip().startswith(p) for p in cfg.ignore_prefixes):
+            return None
+
+        chain = self._message_chain(event)
+        fingerprint_pair = make_fingerprint(chain)
+        if fingerprint_pair is None:
+            return None
+        kind, fingerprint = fingerprint_pair
+
+        detector = self._reread_detector(umo)
+        if not detector.observe(
+            kind, fingerprint, str(event.get_sender_id()), threshold=cfg.threshold_for(kind)
+        ):
+            return None
+
+        # 确认是复读，再决定这次要不要真的跟。
+        recent = detector.recent_follows()
+        seconds_since = (
+            self._clock() - recent[-1] if recent else float("inf")
+        )
+        verdict, reason = reread_gate(
+            settings=cfg,
+            recent_follows=recent,
+            seconds_since_last_follow=seconds_since,
+            roll=random.random(),
+        )
+
+        if verdict is RereadVerdict.TRIGGERED:
+            try:
+                # 复读的灵魂就是"原样再发一遍"，所以直接转发原消息链，
+                # **不经过 LLM** —— 让模型生成反而会破坏它。
+                await event.send(event.make_result().chain_result(list(chain)))
+                detector.mark_followed(fingerprint)
+                self.silence.note_bot(umo)
+                logger.info(f"[BetterChat] 自动复读 {kind}（{reason}）")
+            except Exception:  # noqa: BLE001 - 发送失败不能影响消息流
+                logger.warning("[BetterChat] 复读发送失败", exc_info=True)
+            # 无论成功失败都吞掉这条消息，不再走唤醒判定。
+            self._take_over_turn(event)
+            return verdict
+
+        logger.debug(f"[BetterChat] 检测到复读但本次不跟（{reason}）")
+        self._take_over_turn(event)
+        return verdict
+
+    @staticmethod
+    def _clock() -> float:
+        """单调时钟。抽成方法便于测试注入。"""
+        import time
+
+        return time.monotonic()
+
+    @staticmethod
+    def _message_chain(event: AstrMessageEvent) -> list:
+        chain = getattr(getattr(event, "message_obj", None), "message", None)
+        return list(chain) if isinstance(chain, list) else []
+
+    # ------------------------------------------------------------------ #
+    # 防冷场
+    # ------------------------------------------------------------------ #
+
+    def _cancel_silence_task(self, umo: str) -> None:
+        task = self._silence_tasks.pop(umo, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_silence_check(
+        self, umo: str, event: AstrMessageEvent
+    ) -> None:
+        """有人说话后，安排一次"到时候看看是不是冷场了"的检查。
+
+        刻意用「每条消息重置一个延迟任务」而不是后台轮询：
+        群正常聊天时，旧任务不停被取消，几乎没有开销。
+        """
+        cfg = self._proactive_settings()
+        if not cfg.enable:
+            return
+        self._cancel_silence_task(umo)
+        task = self.state.spawn(self._silence_check(umo, event, cfg))
+        if task is not None:
+            self._silence_tasks[umo] = task
+
+    async def _silence_check(
+        self,
+        umo: str,
+        event: AstrMessageEvent,
+        cfg: ProactiveSettings,
+    ) -> None:
+        """等到沉默阈值后，判断要不要主动开口。"""
+        import datetime
+        import random
+
+        try:
+            # 稍微多等一点随机量，避免整点整齐开口（显得像定时任务）。
+            jitter = random.uniform(0, min(60.0, cfg.silence_seconds * 0.1))
+            await asyncio.sleep(cfg.silence_seconds + jitter)
+
+            state = self.silence.group(umo)
+            today = datetime.date.today().isoformat()
+            action, reason = proactive_gate(
+                settings=cfg,
+                silence_seconds=self.silence.silence_seconds(umo),
+                seconds_since_bot=self.silence.seconds_since_bot(umo),
+                proactive_today=self.silence.proactive_count(umo, day_stamp=today),
+                message_count=state.message_count,
+                hour_of_day=datetime.datetime.now().hour,
+            )
+            if action is not ProactiveAction.SPEAK:
+                logger.debug(f"[BetterChat] 冷场检查跳过（{reason}）")
+                return
+
+            # 交给 Jev 判：现在开口合适吗。
+            answers = await self.jev.decide(
+                state=self._proactive_state(umo, cfg),
+                questions=build_proactive_questions(NoulQuestion),
+            )
+            should_speak = answers["should_speak"].value
+            has_topic = answers["has_topic"].value
+            mood_fit = answers["mood_fit"].value
+
+            # 组合策略（实测调过）：
+            #
+            # 只看 should_speak 太严 —— 实测「有人提了个没人接的问题」这种
+            # 明显该开口的场景，should_speak 只给 0.56，而 has_topic 高达
+            # 0.88。三个信号要一起看：
+            #
+            #   气氛不合适（mood_fit 低）  → 一律不说（吵架/严肃话题）
+            #   有话可接 且 气氛允许        → 说
+            #   纯 should_speak 很高        → 说（兜底）
+            #
+            # 阈值偏保守：宁可少说，也别在群里刷存在感。
+            speak = False
+            if mood_fit >= 0.5:
+                if has_topic >= 0.6 and should_speak >= 0.4:
+                    speak = True
+                elif should_speak >= 0.8:
+                    speak = True
+
+            if not speak:
+                logger.debug(
+                    f"[BetterChat] 冷场不开口（should_speak={should_speak:.2f}"
+                    f" has_topic={has_topic:.2f} mood_fit={mood_fit:.2f}）"
+                )
+                return
+
+            logger.info(
+                f"[BetterChat] 冷场主动开口（should_speak={should_speak:.2f}"
+                f" has_topic={has_topic:.2f} mood_fit={mood_fit:.2f}）"
+            )
+            await self._speak_proactively(umo, event)
+            self.silence.bump_proactive(umo, day_stamp=today)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 冷场检查失败绝不能影响聊天
+            logger.warning("[BetterChat] 冷场检查异常", exc_info=True)
+
+    def _proactive_state(self, umo: str, cfg: ProactiveSettings) -> dict:
+        """冷场判定用的 state。只放事实，规则在 instructions 里。"""
+        history = self.transcripts.recent(umo, cfg.context_messages)
+        return build_gate_state(
+            group_name="",
+            latest="",
+            context=history,
+            bot_messages=[],
+            bot_name=self._bot_name_hint(),
+            latest_sender="",
+            bot_mentioned=False,
+        ) | {
+            "silence_seconds": round(self.silence.silence_seconds(umo), 1),
+            "seconds_since_bot_spoke": round(self.silence.seconds_since_bot(umo), 1),
+        }
+
+    def _bot_name_hint(self) -> str:
+        try:
+            cfg = self.context.get_config(umo=None)
+            name = cfg.get("platform_settings", {}).get("nickname")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+    async def _speak_proactively(
+        self, umo: str, event: AstrMessageEvent
+    ) -> None:
+        """主动开口：注入一个官方 CronMessageEvent，让主 LLM 正常生成。
+
+        为什么不用 ``provider.text_chat`` 直接调模型：那样会绕过整个管线，
+        人设、长期记忆、工具、发送钩子全部失效，发出来的话会很不像这个 Bot。
+        走官方事件队列则完全等价于"有人在说话"，只不过说话者是定时任务。
+        """
+        try:
+            from astrbot.core.cron.events import CronMessageEvent
+            from astrbot.core.platform.message_session import MessageSession
+        except ImportError:
+            logger.warning("[BetterChat] 当前 AstrBot 版本没有 CronMessageEvent，冷场功能不可用")
+            return
+
+        try:
+            session = MessageSession.from_str(umo)
+        except Exception:  # noqa: BLE001
+            logger.warning(f"[BetterChat] 无法解析会话标识：{umo}")
+            return
+
+        prompt = (
+            "群聊已经安静了一段时间，你可以自然地开口说一句话。"
+            "要求：结合最近的聊天内容，简短、口语化、像群友随口说的；"
+            "不要生硬地开启新话题，不要长篇大论，不要提到自己是程序。"
+            "如果确实没什么可说的，就只回一个句号。"
+        )
+        try:
+            synthetic = CronMessageEvent(
+                context=self.context,
+                session=session,
+                message=prompt,
+                sender_name="BetterChat",
+                message_type=session.message_type,
+                extras={"_betterchat_proactive": True},
+            )
+        except Exception:  # noqa: BLE001 - 构造失败不能崩
+            logger.warning("[BetterChat] 构造冷场事件失败", exc_info=True)
+            return
+
+        try:
+            await self.context.get_event_queue().put(synthetic)
+        except Exception:  # noqa: BLE001
+            logger.warning("[BetterChat] 冷场事件入队失败", exc_info=True)
+
     def _remember_group_message(
         self, umo: str, event: AstrMessageEvent, text: str
     ) -> None:
@@ -1003,6 +1322,8 @@ class BetterChatPlugin(Star):
         面板每次保存配置都会走这里，所以必须干净：唤醒等待者、取消
         后台任务、关闭 HTTP 连接，且不能抛异常。
         """
+        for umo in list(self._silence_tasks):
+            self._cancel_silence_task(umo)
         try:
             await self.group_agg.close()
         except Exception:  # noqa: BLE001

@@ -15,6 +15,41 @@
 
 ---
 
+## [1.5.3] - 2026-11-03
+
+### 修复
+
+- **合并文本缺了最后一句，Bot 回「话只说一半」**。
+
+  实测：用户连发 4 条（Sticker / 那你能 / 抱抱我吗 / QAQ）。
+
+  ```
+  22:41:14  那你能     → 进我们窗口
+  22:41:15  LivingMemory 收到 query='那你能'   ← 第一轮已跑起来
+  22:41:17  QAQ       → 被 AstrBot 的 follow_up 接走
+  22:41:20  我们合并 3 条                       ← 缺了 QAQ
+  ```
+
+  根因：AstrBot 的 `follow_up` 在我们的钩子**之前**执行
+  （`internal.py` 里 `try_capture_follow_up` 在
+  `OnWaitingLLMRequestEvent` 之前），条件是「该会话有活跃 agent runner
+  且发送者相同」。被它接走的消息**根本到不了我们这里**，于是我们攒的
+  那一份少了最后一句。
+
+  修复：新增 `_follow_up_will_take()`，检测到 follow_up 会接管时
+  **直接让路**，不参与合并。
+
+- 顺带记录一个设计取舍：也让路给了 **follow_up**，而不是无脑打断。
+  AstrBot 已经用 follow_up 处理「生成中的补充消息」，我们再攒一份就是重复；
+  而无脑打断会浪费已生成的 token，且用户打错字补一句时整轮都作废。
+
+### 说明
+
+- 这个 bug 是 1.5.2 修好「窗口内不互相打断」之后才暴露的：
+  以前窗口根本活不下来，也就看不出少了一句。
+
+---
+
 ## [1.5.2] - 2026-11-03
 
 ### 修复
@@ -437,7 +472,8 @@
 
 ---
 
-[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.2...HEAD
+[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.3...HEAD
+[1.5.3]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.2...v1.5.0

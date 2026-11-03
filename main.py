@@ -329,6 +329,42 @@ class BetterChatPlugin(Star):
             pass
         return False
 
+    @staticmethod
+    def _follow_up_will_take(umo: str, event: AstrMessageEvent) -> bool:
+        """AstrBot 的 ``follow_up`` 机制会不会接走这条消息。
+
+        为什么必须检测：``follow_up`` 在我们的钩子**之前**执行
+        （``internal.py`` 里 ``try_capture_follow_up`` 在
+        ``OnWaitingLLMRequestEvent`` 之前）。它的条件是「该会话有活跃
+        agent runner 且发送者相同」。
+
+        如果它会接走这条消息，我们就**不该**把它攒进合并窗口：
+        - 它的内容会作为 follow-up 塞进正在跑的那一轮
+        - 我们攒着的副本到期后又会触发第二轮，两边抢消息
+
+        实测发生过：用户连发 4 条，第 1 条先走 LLM 起了 runner，
+        第 4 条被 follow_up 接走，而我们窗口里还攒着 3 条 ——
+        结果合并出来的文本缺了最后一句，Bot 回「话只说一半」。
+        """
+        try:
+            from astrbot.core.pipeline.process_stage.follow_up import (
+                _ACTIVE_AGENT_RUNNERS,
+            )
+        except Exception:  # noqa: BLE001 - 内部模块不可用时保守返回 False
+            return False
+        try:
+            runner = _ACTIVE_AGENT_RUNNERS.get(umo)
+            if runner is None:
+                return False
+            runner_event = getattr(
+                getattr(runner.run_context, "context", None), "event", None
+            )
+            if runner_event is None:
+                return False
+            return str(runner_event.get_sender_id()) == str(event.get_sender_id())
+        except Exception:  # noqa: BLE001
+            return False
+
     def _interrupt_in_flight(
         self,
         umo: str,
@@ -384,6 +420,16 @@ class BetterChatPlugin(Star):
                 return
             text = (event.message_str or "").strip()
             if text and settings.should_ignore(text):
+                self._register_in_flight(umo, event)
+                return
+            # 如果 AstrBot 的 follow_up 会接走这条消息，就直接让路 ——
+            # 它会作为补充内容塞进正在跑的那一轮，我们再攒一份只会重复。
+            #
+            # 实测踩过：用户连发 4 条，第 1 条先跑起来起了 runner，
+            # 第 4 条被 follow_up 接走，而我们窗口里还攒着 3 条 ——
+            # 合并文本缺了最后一句，Bot 回「能什么？话只说一半」。
+            if self._follow_up_will_take(umo, event):
+                logger.debug("[BetterChat] 交给 follow_up 处理，不参与合并")
                 self._register_in_flight(umo, event)
                 return
             # 非纯文本（图片 / 表情 / 文件）也进入合并窗口，只是不参与

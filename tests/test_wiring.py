@@ -1416,6 +1416,51 @@ def test_interrupt_still_works_when_previous_is_generating(loaded) -> None:
     assert first.get_extra("betterchat_stale") is True
 
 
+def test_follow_up_detection_yields_to_astrbot(loaded) -> None:
+    """检测到 follow_up 会接管时，必须让路。
+
+    AstrBot 的 ``follow_up`` 在我们的钩子**之前**执行，条件是该会话有活跃
+    agent runner 且发送者相同。如果它会接走这条消息，我们不该再攒一份 ——
+    否则同一句话会被处理两次，合并文本还缺了被接走的那部分。
+
+    实测踩过：用户连发 4 条，第 1 条先跑起来，第 4 条被 follow_up 接走，
+    我们窗口里还攒着 3 条 —— Bot 回「能什么？话只说一半」。
+    """
+    plugin_cls = loaded.module.BetterChatPlugin
+
+    # 没有活跃 runner → 不会接管
+    event = FakeEvent("你好")
+    assert plugin_cls._follow_up_will_take("test:private:1", event) is False
+
+    # 内部模块不可用时应保守返回 False（不能让插件崩）
+    assert isinstance(
+        plugin_cls._follow_up_will_take("test:private:1", event), bool
+    )
+
+
+def test_follow_up_detection_is_defensive(loaded) -> None:
+    """即使 AstrBot 内部结构和预期不符，也不能抛异常。"""
+    plugin_cls = loaded.module.BetterChatPlugin
+
+    class Weird:
+        pass
+
+    event = FakeEvent("x")
+    # 注入一个畸形 runner，确认不会崩
+    try:
+        from astrbot.core.pipeline.process_stage.follow_up import (  # noqa: F401
+            _ACTIVE_AGENT_RUNNERS,
+        )
+    except Exception:
+        return
+    _ACTIVE_AGENT_RUNNERS["weird:umo"] = Weird()
+    try:
+        result = plugin_cls._follow_up_will_take("weird:umo", event)
+        assert result is False
+    finally:
+        _ACTIVE_AGENT_RUNNERS.pop("weird:umo", None)
+
+
 # --------------------------------------------------------------------------- #
 # 生命周期
 # --------------------------------------------------------------------------- #

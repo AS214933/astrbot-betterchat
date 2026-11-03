@@ -15,6 +15,43 @@
 
 ---
 
+## [1.5.1] - 2026-11-03
+
+### 修复
+
+- **私聊：非纯文本消息绕过合并窗口，导致一次行为产生两个回复**。
+
+  实测场景：用户连发「有你就够了」+「欸嘿」+ 一个 Sticker。
+
+  ```
+  14:57:30  有你就够了      → 进合并窗口
+  14:57:31  欸嘿            → 刷新窗口（2 条待合并）
+  14:57:34  Sticker         → is_plain_text=False → 直接放行
+  14:58:06  才发出回复       ← 距第一条 36 秒
+  ```
+
+  Sticker 绕过窗口单独触发了一次 LLM 请求，而攒着的两句到期后又触发
+  第二次 —— 两个回复互相排队，延迟被拖到 30 秒以上。
+
+  现在非文本消息也进入合并窗口（只是不参与文本拼接），一轮只有一个出口。
+
+- **Jev 返回空响应体时完全无法诊断**。某些 400 只给状态码不给 body，
+  日志里只剩 `HTTP 400: `，看不出是哪个字段的问题。
+
+  现在会补上请求侧摘要：`status` / `channel` / `model` / `endpoint` /
+  `state_chars` / `questions`。
+
+- **冷场检查把 Jev 不可用当成意外异常**，打印完整堆栈。Jev 故障、熔断、
+  超时都是**预期内的降级场景**，不该刷堆栈（看着像插件崩了）。
+  现在走统一的降级日志路径。
+
+### 说明
+
+- 测试里一处浮点断言改用 `pytest.approx`（`29.999999999992724 != 30`），
+  是测试本身的精度问题，与实现无关。
+
+---
+
 ## [1.5.0] - 2026-11-02
 
 ### 变更
@@ -367,7 +404,8 @@
 
 ---
 
-[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.0...HEAD
+[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.2...v1.5.0
 [1.4.2]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.0...v1.4.1

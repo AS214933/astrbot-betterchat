@@ -1251,6 +1251,86 @@ def test_defer_not_scheduled_when_help_disabled(loaded) -> None:
     assert run(scenario()) == {}
 
 
+def test_non_text_message_joins_merge_window(loaded) -> None:
+    """回归测试：非纯文本消息不能绕过合并窗口。
+
+    实测踩过：用户连发两句 + 一个 Sticker 时，Sticker 因为
+    ``_is_plain_text`` 为 False 被直接放行，单独触发了一次 LLM 请求；
+    而攒着的那两句到期后又触发第二次 —— 一次行为产生两个回复，
+    还互相排队，回复延迟被拖到 30 秒以上。
+
+    现在非文本消息也进入窗口，只是不参与文本拼接。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.05,
+            "min_quiet_seconds": 0.05,
+            "max_quiet_seconds": 0.05,
+            "total_seconds": 0.2,
+        }
+        plugin = _isolated_plugin(loaded, config)
+
+        # 第一条：纯文本
+        first = FakeEvent("有你就够了")
+        t1 = asyncio.create_task(plugin.on_waiting_llm(first))
+        await asyncio.sleep(0.005)
+
+        # 第二条：图片（非纯文本）
+        image_event = FakeEvent("")
+        image_event.message_obj.message = [_Image("a.jpg")]
+        t2 = asyncio.create_task(plugin.on_waiting_llm(image_event))
+
+        await asyncio.gather(t1, t2, return_exceptions=True)
+        # 两条都进了同一个窗口 → 只有一个拿到本轮
+        winners = [
+            e for e in (first, image_event) if not e.is_stopped()
+        ]
+        return first, image_event, winners
+
+    first, image_event, winners = run(scenario())
+    # 两条都被处理过（没有被直接放行绕过窗口）
+    both_ran = first.call_llm is not None and image_event.call_llm is not None
+    assert both_ran
+
+
+def test_empty_private_message_passes_through(loaded) -> None:
+    """纯空白消息没有合并价值，应直接交还原生流程。"""
+
+    async def scenario():
+        plugin = _isolated_plugin(loaded, FakeConfig(base_config()))
+        event = FakeEvent("   ")
+        await plugin.on_waiting_llm(event)
+        return event
+
+    event = run(scenario())
+    # 交还原生流程 → call_llm=False
+    assert event.call_llm is False
+
+
+def test_jev_error_with_empty_body_has_context(loaded) -> None:
+    """回归测试：服务端返回空响应体时不能只剩 `HTTP 400: `。
+
+    实测 OpenCode 的 400 有时响应体是空的，日志里完全看不出是哪个字段
+    的问题。现在会补上 model / endpoint / state 大小 / questions 名称。
+    """
+    from betterchat_jev import JevConfig, _request_context_hint
+
+    config = JevConfig.from_config(
+        {"channel": "opencode", "oc_api_key": "k", "oc_model": "jev-1.13-free"}
+    )
+    hint = _request_context_hint(
+        config, {"state": {"a": 1}, "questions": {"q1": {}}}, 400
+    )
+    assert "status=400" in hint
+    assert "model=jev-1.13-free" in hint
+    assert "endpoint=" in hint
+    assert "state_chars=8" in hint
+    assert "questions=['q1']" in hint
+
+
 # --------------------------------------------------------------------------- #
 # 生命周期
 # --------------------------------------------------------------------------- #

@@ -13,6 +13,8 @@ import pathlib
 import sys
 import time
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from betterchat_state import RateLimiter, RuntimeState  # noqa: E402
@@ -170,7 +172,8 @@ def test_seconds_since_uses_monotonic_clock() -> None:
     state = RuntimeState()
     now = time.monotonic()
     state.note_bot_message("g1", now=now)
-    assert state.seconds_since_bot_spoke("g1", now=now + 30) == 30
+    # 用 approx：浮点减法会有微小误差（如 29.999999999992724）。
+    assert state.seconds_since_bot_spoke("g1", now=now + 30) == pytest.approx(30)
 
 
 def test_never_spoken_returns_infinity() -> None:

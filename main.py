@@ -361,11 +361,18 @@ class BetterChatPlugin(Star):
             if not settings.enable:
                 self._register_in_flight(umo, event)
                 return
-            if not self._is_plain_text(event):
+            text = (event.message_str or "").strip()
+            if text and settings.should_ignore(text):
                 self._register_in_flight(umo, event)
                 return
-            text = (event.message_str or "").strip()
-            if not text or settings.should_ignore(text):
+            # 非纯文本（图片 / 表情 / 文件）也进入合并窗口，只是不参与
+            # 文本拼接 —— 它这一轮必须**陪着**前面攒下的文字一起走。
+            #
+            # 曾经这里直接 return 放行，导致：用户连发两句 + 一个表情时，
+            # 表情会绕过窗口单独触发一次 LLM 请求，而攒着的两句到期后又
+            # 触发第二次 —— 一次行为产生两个回复，还互相排队拖慢。
+            if not text and self._is_plain_text(event):
+                # 空消息（纯空白）没什么可合并的，交还原生流程。
                 self._register_in_flight(umo, event)
                 return
             owns_turn = await self._merge_turn(umo, event, text)
@@ -450,8 +457,16 @@ class BetterChatPlugin(Star):
 
         merged, count = settled
         if count > 1 or merged != text:
-            self._replace_text(event, merged)
-            logger.info(f"[BetterChat] 合并 {count} 条消息（{len(merged)} 字符）")
+            # 合并结果为空而本事件是图片/表情时，**不要**用空串覆盖它 ——
+            # 那样会把消息内容清掉。让原生流程照常处理这条非文本消息，
+            # 前面攒的文字已经作为会话历史进入了上下文。
+            if merged:
+                self._replace_text(event, merged)
+                logger.info(f"[BetterChat] 合并 {count} 条消息（{len(merged)} 字符）")
+            elif not text:
+                logger.debug(
+                    "[BetterChat] 本轮只有非文本消息，保留原消息内容"
+                )
         event.set_extra(EXTRA_TICKET, reservation.ticket)
         # 合并完成，交还给 AstrBot 的原生流程（人设/记忆/工具全部保留）。
         self._let_astrbot_handle(event)
@@ -1187,6 +1202,10 @@ class BetterChatPlugin(Star):
 
         except asyncio.CancelledError:
             raise
+        except JevError as exc:
+            # Jev 不可用是**预期内的**降级场景（服务端故障 / 熔断 / 超时），
+            # 不该打完整堆栈 —— 那会把日志刷爆，而且看着像插件崩了。
+            self._log_jev_failure(exc)
         except Exception:  # noqa: BLE001 - 冷场检查失败绝不能影响聊天
             logger.warning("[BetterChat] 冷场检查异常", exc_info=True)
 

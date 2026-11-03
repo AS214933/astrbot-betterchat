@@ -23,6 +23,7 @@ Jev 是 TypeSafe 的结构化判定模型：你给它一段 ``state``（可以�
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import time
 from dataclasses import dataclass, field
@@ -535,12 +536,42 @@ class JevClient:
         ) as response:
             if response.status != 200:
                 text = await response.text()
+                # 响应体可能是空的（某些 400/5xx 只给状态码），这时至少要把
+                # 请求的关键信息带出来，否则日志里只有 "HTTP 400: " 完全没法排查。
+                if not text.strip():
+                    text = _request_context_hint(
+                        self.config, payload, response.status
+                    )
                 raise JevError(
                     _explain_http_error(
                         status=response.status, body=text, channel=self.config.channel
                     )
                 )
             return await response.json(content_type=None)
+
+
+def _request_context_hint(
+    config: "JevConfig", payload: Mapping[str, Any], status: int
+) -> str:
+    """服务端返回空响应体时，把请求侧的关键信息拼成可诊断的文本。
+
+    实测 OpenCode 的 400 有时响应体就是空的，日志里只剩 ``HTTP 400:`` ——
+    完全看不出是哪个字段的问题。这里补上 model、endpoint、state 大小、
+    questions 名称等，至少能判断是"请求太大"还是"某个字段不合法"。
+    """
+    state = payload.get("state")
+    questions = payload.get("questions")
+    try:
+        state_chars = len(json.dumps(state, ensure_ascii=False))
+    except Exception:  # noqa: BLE001
+        state_chars = -1
+    q_names = list(questions) if isinstance(questions, Mapping) else []
+    return (
+        f"（服务端未返回响应体，以下是请求侧摘要）"
+        f"status={status} channel={config.channel} "
+        f"model={config.active_model()} endpoint={config.endpoint()} "
+        f"state_chars={state_chars} questions={q_names}"
+    )
 
 
 def _explain_http_error(*, status: int, body: str, channel: str) -> str:

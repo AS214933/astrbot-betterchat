@@ -83,7 +83,8 @@ def test_quiet_seconds_clamped_between_bounds() -> None:
 
 
 def test_settings_from_bad_config_falls_back_to_defaults() -> None:
-    assert MergeSettings.from_config("not a dict").base_quiet_seconds == 2.0
+    # 默认 base_quiet = 4.0（按实测打字节奏调的，见 MergeSettings 注释）
+    assert MergeSettings.from_config("not a dict").base_quiet_seconds == 4.0
 
     # 下限 > 上限时自动规整。
     settings = MergeSettings.from_config(
@@ -92,7 +93,7 @@ def test_settings_from_bad_config_falls_back_to_defaults() -> None:
     assert settings.max_quiet_seconds >= settings.min_quiet_seconds
 
     # NaN / 非数字退回默认。
-    assert MergeSettings.from_config({"base_quiet_seconds": "abc"}).base_quiet_seconds == 2.0
+    assert MergeSettings.from_config({"base_quiet_seconds": "abc"}).base_quiet_seconds == 4.0
 
 
 def test_should_ignore_respects_prefixes() -> None:
@@ -241,6 +242,30 @@ def test_prune_removes_stale_turns() -> None:
     window.reserve("new", "y")
     assert "old" not in window._turns  # noqa: SLF001 - 测试内部状态
     assert "new" in window._turns  # noqa: SLF001
+
+
+def test_default_window_covers_realistic_typing_gaps() -> None:
+    """默认窗口必须能覆盖真实的打字间隔。
+
+    实测用户连发消息的间隔从 0.7 秒到 8.6 秒都有。原来的 base=2.0 时，
+    间隔 3.57 秒的下一句就漏在窗口外 —— 第一条单独跑了一轮回复，
+    后面几条又合并成第二轮，用户看到两句毫不相干的话。
+    """
+    settings = MergeSettings()
+    # 3.6 秒的间隔（实测出现过的值）必须仍在窗口内
+    assert quiet_seconds_for("不知道...", settings) > 3.6
+    # 但也不能长到让人等太久
+    assert quiet_seconds_for("不知道...", settings) <= 6.0
+    # 硬上限要大于窗口，否则窗口永远到不了
+    assert settings.total_seconds > settings.max_quiet_seconds
+
+
+def test_window_still_capped_by_total() -> None:
+    """就算连着打字，也不会超过整轮硬上限。"""
+    settings = MergeSettings()
+    very_long = "字" * 1000
+    assert quiet_seconds_for(very_long, settings) <= settings.max_quiet_seconds
+    assert settings.total_seconds >= settings.max_quiet_seconds
 
 
 # --------------------------------------------------------------------------- #

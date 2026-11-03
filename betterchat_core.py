@@ -105,10 +105,18 @@ class MergeSettings:
     """私聊合并的可调参数，对应面板里的「私聊合并」分组。"""
 
     enable: bool = True
-    base_quiet_seconds: float = 2.0
-    min_quiet_seconds: float = 1.5
-    max_quiet_seconds: float = 4.0
-    total_seconds: float = 8.0
+    # 默认值按「人在聊天里打字的真实节奏」调过：
+    #
+    # 实测用户连发消息的间隔从 0.7 秒到 8.6 秒都有。原来 base=2.0 时，
+    # 间隔 3.57 秒的下一句就会漏在窗口外 —— 第一条单独跑了一轮回复，
+    # 后面几条又合并成第二轮，用户会看到两句毫不相干的话。
+    #
+    # base=4.0 能覆盖「想一句、打一句」的常见节奏；更长的停顿本来
+    # 就该算新的一轮。上限由 total_seconds 兜底，不会无限等。
+    base_quiet_seconds: float = 4.0
+    min_quiet_seconds: float = 2.5
+    max_quiet_seconds: float = 6.0
+    total_seconds: float = 12.0
     length_scale_chars: int = 60
     max_messages: int = 8
     max_chars: int = 4000
@@ -119,8 +127,8 @@ class MergeSettings:
         """从插件配置里解析，任何缺失/非法字段都退回默认值。"""
         section = raw if isinstance(raw, dict) else {}
 
-        min_quiet = _as_float(section.get("min_quiet_seconds", 1.5), 1.5)
-        max_quiet = _as_float(section.get("max_quiet_seconds", 4.0), 4.0)
+        min_quiet = _as_float(section.get("min_quiet_seconds", 2.5), 2.5)
+        max_quiet = _as_float(section.get("max_quiet_seconds", 6.0), 6.0)
         # 下限永远不能超过上限，否则 clamp 会失效；这里做一次规整。
         if max_quiet < min_quiet:
             max_quiet = min_quiet
@@ -132,10 +140,10 @@ class MergeSettings:
 
         return cls(
             enable=bool(section.get("enable", True)),
-            base_quiet_seconds=_as_float(section.get("base_quiet_seconds", 2.0), 2.0),
+            base_quiet_seconds=_as_float(section.get("base_quiet_seconds", 4.0), 4.0),
             min_quiet_seconds=min_quiet,
             max_quiet_seconds=max_quiet,
-            total_seconds=max(0.1, _as_float(section.get("total_seconds", 8.0), 8.0)),
+            total_seconds=max(0.1, _as_float(section.get("total_seconds", 12.0), 12.0)),
             length_scale_chars=max(0, _as_int(section.get("length_scale_chars", 60), 60)),
             max_messages=max(0, _as_int(section.get("max_messages", 8), 8)),
             max_chars=max(0, _as_int(section.get("max_chars", 4000), 4000)),

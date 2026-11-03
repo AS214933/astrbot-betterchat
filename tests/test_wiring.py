@@ -360,7 +360,7 @@ def test_plugin_survives_garbage_config(loaded) -> None:
         }
     )
     plugin = loaded.module.BetterChatPlugin(context=None, config=config)
-    assert plugin._merge_settings().base_quiet_seconds == 2.0  # noqa: SLF001
+    assert plugin._merge_settings().base_quiet_seconds == 4.0  # noqa: SLF001
     assert plugin.jev.config.timeout_seconds == 3.0
     assert plugin.jev.config.reply_threshold == 0.7
 

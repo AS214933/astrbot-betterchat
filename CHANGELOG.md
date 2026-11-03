@@ -15,6 +15,40 @@
 
 ---
 
+## [1.5.4] - 2026-11-03
+
+### 变更
+
+- **合并窗口的默认值按真实打字节奏重新调整**：
+
+  | 参数 | 旧 | 新 |
+  |---|---|---|
+  | `base_quiet_seconds` | 2.0 | **4.0** |
+  | `min_quiet_seconds` | 1.5 | **2.5** |
+  | `max_quiet_seconds` | 4.0 | **6.0** |
+  | `total_seconds` | 8.0 | **12.0** |
+
+  原因是实测出来的：用户连发消息的间隔从 0.7 秒到 8.6 秒都有。
+  旧的 2 秒窗口下，间隔 3.57 秒的第二句就漏在窗口外了 ——
+
+  ```
+  22:49:54  不知道...        → 进窗口，2 秒后单独结算
+  22:49:57  感觉被别人抛了    → 开新窗口
+  22:49:59  QAQ             → 又被 follow_up 接走
+  ```
+
+  结果同一段话被拆成**三轮回复**，内容还各说各的。
+
+  新默认值下同样三条消息会全部合并成一轮（窗口 4.1 秒 > 3.57 秒间隔）。
+
+### 说明
+
+- 这不是 bug，是参数和真实使用节奏不匹配。窗口调大后「说完一句就得等 4 秒」，
+  如果你觉得慢，可以在面板把 `base_quiet_seconds` 调回 2~3 秒 ——
+  代价是偶尔把一句话拆成两轮。
+
+---
+
 ## [1.5.3] - 2026-11-03
 
 ### 修复
@@ -472,7 +506,8 @@
 
 ---
 
-[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.3...HEAD
+[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.4...HEAD
+[1.5.4]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.3...v1.5.4
 [1.5.3]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.0...v1.5.1

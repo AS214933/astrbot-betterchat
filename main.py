@@ -308,6 +308,27 @@ class BetterChatPlugin(Star):
         """把本轮交还给 AstrBot 原生的 LLM 流程。"""
         event.should_call_llm(False)
 
+    def _is_generating(self, event: AstrMessageEvent) -> bool:
+        """这条事件是否**已经开始生成回复**（而不是还在合并窗口里等）。
+
+        关键区别：还在窗口里等待的事件绝不能被打断 —— 否则用户连发两条时，
+        第二条会把第一条打断，合并永远不可能发生。
+
+        判据用我们自己维护的标记 ``EXTRA_TICKET``：它只在本事件**成功结算**
+        （拿到本轮、写回合并文本）时设置。没有这个标记 = 还在等，或者
+        根本没进过窗口。
+        """
+        if event.get_extra(EXTRA_TICKET) is not None:
+            return True
+        # 兜底：已经有产出结果，说明确实在生成。
+        try:
+            result = event.get_result()
+            if result is not None and getattr(result, "chain", None):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
     def _interrupt_in_flight(
         self,
         umo: str,
@@ -415,9 +436,15 @@ class BetterChatPlugin(Star):
         """
         reservation = self.merge.reserve(umo, text)
 
-        # 从这一刻起本事件就是「本会话正在进行的那一轮」，后来的消息据此
-        # 判断要不要打断它 —— 此时它还只是在等待合并，并没有真的开始生成。
-        # 这恰恰是打断要覆盖的场景：用户在你攒话的时候又补了一句。
+        # 判断上一轮处于哪个阶段，这决定了本次该做什么：
+        #
+        #   * 还在**合并窗口**里（没开始生成）→ 加入它，一起合并
+        #   * 已经**在生成**            → 按配置打断它，重新开始
+        #
+        # 早期版本只看了 in_flight 有没有值，于是把"还在窗口里等"的上一轮
+        # 也当成"正在生成"去打断。结果用户连发两条时，第二条会把第一条
+        # 打断，然后自己成为新的 in_flight，第三条再打断它…… 连锁下去
+        # 就变成了"每条消息各自回复一次"，合并形同虚设。
         previous = self.state.in_flight.get(umo)
         self._register_in_flight(umo, event)
 
@@ -425,14 +452,13 @@ class BetterChatPlugin(Star):
         previous_ticket = run.latest_ticket
         run.latest_ticket = reservation.ticket
 
-        # 只有当上一轮确实还挂在那儿（真的在跑）时才打断；
-        # 已经跑完的轮次不该被误伤。
         if (
             self._interrupt_enabled()
             and previous is not None
             and previous is not event
             and previous_ticket
             and previous_ticket != reservation.ticket
+            and self._is_generating(previous)
         ):
             self._interrupt_in_flight(umo, event, previous=previous)
 

@@ -562,11 +562,16 @@ def test_non_stale_result_is_untouched(loaded) -> None:
     assert event.is_stopped() is False
 
 
-def test_second_private_message_interrupts_the_first(loaded) -> None:
-    """回归测试：第二条私聊消息必须真的能打断第一条。
+def test_second_message_joins_window_instead_of_interrupting(loaded) -> None:
+    """回归测试：第二条消息在窗口内到达时，必须**加入合并**，不能打断第一条。
 
-    这里曾经有个 bug —— ``in_flight`` 在合并逻辑**之前**就被设成了当前
-    事件，于是「打断旧事件」的检查永远读到自己，私聊打断完全失效。
+    这里踩过两个连环坑：
+    1. 早期 ``in_flight`` 在合并逻辑之前就被设成当前事件，
+       「打断旧事件」的检查永远读到自己 → 打断完全失效。
+    2. 修了之后又过头了：把「还在窗口里等」的上一轮也当成
+       「正在生成」去打断 → 用户连发两条时，第二条把第一条打断，
+       自己成为新的 in_flight，第三条再打断它……
+       连锁下去就变成「每条消息各自回复一次」，合并形同虚设。
     """
 
     async def scenario():
@@ -588,17 +593,16 @@ def test_second_private_message_interrupts_the_first(loaded) -> None:
         assert plugin.state.in_flight.get(first.unified_msg_origin) is first
 
         second = FakeEvent("第二句话")
-        # 打断发生在第二条进入窗口之前。
+        # 第二条在窗口内到达 → 应当并入，而不是打断。
         await plugin.on_waiting_llm(second)
 
         await asyncio.wait_for(first_task, timeout=2.0)
 
-        # 第一条被标记为失效 -> 它一个字都不会发出去。
-        assert first.get_extra("betterchat_stale") is True
-        # 第二条拿到本轮 -> 交还原生流程。
-        assert second.call_llm is False
-        # 第二条成为新的在跑事件。
-        assert plugin.state.in_flight.get(second.unified_msg_origin) is second
+        # 第一条**不该**被标记为失效（它是被合并，不是被打断）。
+        assert first.get_extra("betterchat_stale") is None
+        # 两条都进了同一个窗口 → 只有一个拿到本轮。
+        winners = [e for e in (first, second) if e.call_llm is False]
+        assert len(winners) == 1, "应当只有一个事件继续走 LLM"
         return True
 
     assert run(scenario()) is True
@@ -1329,6 +1333,87 @@ def test_jev_error_with_empty_body_has_context(loaded) -> None:
     assert "endpoint=" in hint
     assert "state_chars=8" in hint
     assert "questions=['q1']" in hint
+
+
+def test_burst_of_private_messages_merges_into_one(loaded) -> None:
+    """回归测试：连发多条只能产生一次回复。
+
+    这是「每条都回复」的直接回归用例：如果合并窗口被打断逻辑误伤，
+    每条消息都会各自走一次 LLM。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.08,
+            "min_quiet_seconds": 0.08,
+            "max_quiet_seconds": 0.08,
+            "total_seconds": 0.4,
+        }
+        config["interrupt"] = {"enable": True, "mode": "graceful"}
+        plugin = _isolated_plugin(loaded, config)
+
+        texts = ["有你就够了", "欸嘿", "那你别管"]
+        tasks = []
+        for text in texts:
+            event = FakeEvent(text)
+            tasks.append((event, asyncio.create_task(plugin.on_waiting_llm(event))))
+            await asyncio.sleep(0.01)  # 模拟连续打字
+
+        for _e, task in tasks:
+            await asyncio.wait_for(task, timeout=3.0)
+        return tasks
+
+    tasks = run(scenario())
+    events = [e for e, _ in tasks]
+
+    # 只有一条继续走 LLM，其余都被合并掉了。
+    winners = [e for e in events if e.call_llm is False]
+    assert len(winners) == 1, f"应当只回复一次，实际 {len(winners)} 次"
+
+    # 胜出者拿到的是合并后的文本。
+    assert winners[0].message_str == "有你就够了\n欸嘿\n那你别管"
+
+    # 不该有任何事件被标记为 stale（那是"被打断"才有的）。
+    assert not any(e.get_extra("betterchat_stale") for e in events)
+
+
+def test_interrupt_still_works_when_previous_is_generating(loaded) -> None:
+    """真正在生成的那一轮，仍然可以被新消息打断。
+
+    「不该打断窗口内的」不等于「不该打断生成中的」——
+    后者是核心功能，必须保留。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.02,
+            "min_quiet_seconds": 0.02,
+            "max_quiet_seconds": 0.02,
+            "total_seconds": 0.1,
+        }
+        config["interrupt"] = {"enable": True, "mode": "graceful"}
+        plugin = _isolated_plugin(loaded, config)
+
+        # 第一条：完整走完合并窗口，拿到本轮（模拟"正在生成"）
+        first = FakeEvent("第一句")
+        await plugin.on_waiting_llm(first)
+        assert first.call_llm is False
+        assert first.get_extra("betterchat_ticket") is not None
+
+        # 第二条：应当打断第一条
+        second = FakeEvent("第二句")
+        await plugin.on_waiting_llm(second)
+
+        # 第一条被标记 stale，内容不会发出去。
+        assert first.get_extra("betterchat_stale") is True
+        return first, second
+
+    first, second = run(scenario())
+    assert first.get_extra("betterchat_stale") is True
 
 
 # --------------------------------------------------------------------------- #

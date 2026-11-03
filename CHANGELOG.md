@@ -15,6 +15,39 @@
 
 ---
 
+## [1.5.2] - 2026-11-03
+
+### 修复
+
+- **私聊连发时每条消息各自回复一次**（关键）。合并彻底失效。
+
+  根因是打断逻辑判断过头了。它只看「上一轮还在不在 `in_flight` 里」，
+  而 `in_flight` 从**合并窗口开始**就登记、直到消息发送后才清理 ——
+  于是「还在窗口里等」的上一轮被误判成「正在生成」，直接被 `stop_event`。
+
+  连锁反应：
+
+  ```
+  用户发 A → A 进窗口 → B 到来 → 打断 A → B 成为新 in_flight
+                    → C 到来 → 打断 B → C 成为新 in_flight → ...
+  ```
+
+  结果是每条消息都把前一条打断，合并窗口一次都没成功结算过。
+
+  修复：新增 `_is_generating()`，用 `EXTRA_TICKET` 标记区分阶段 ——
+  只有**真正结算过**（拿到本轮、写过合并文本）的事件才允许被打断。
+  还在窗口里等的一律走合并。
+
+  - 连发三条 → 只回复一次（新增回归用例）
+  - 生成中仍可被新消息打断（核心功能保留，新增回归用例）
+
+### 说明
+
+- 这次的 bug 是上一次修复（1.5.1 让非文本消息也进窗口）暴露出来的：
+  以前表情会绕过窗口，掩盖了「窗口内的消息互相打断」这个问题。
+
+---
+
 ## [1.5.1] - 2026-11-03
 
 ### 修复
@@ -404,7 +437,8 @@
 
 ---
 
-[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.1...HEAD
+[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.2...HEAD
+[1.5.2]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.2...v1.5.0
 [1.4.2]: https://github.com/AS214933/astrbot-betterchat/compare/v1.4.1...v1.4.2

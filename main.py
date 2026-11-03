@@ -600,6 +600,45 @@ class BetterChatPlugin(Star):
     # ------------------------------------------------------------------ #
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=-1000)
+    async def on_preempt_private(self, event: AstrMessageEvent) -> None:
+        """私聊「打断优先」：抢在 AstrBot 的 follow_up 之前处理。
+
+        **为什么必须在 handler 阶段做，而不是在 on_waiting_llm_request：**
+
+        ``ProcessStage`` 里的顺序是
+        ``star_request_sub_stage``（插件 handler）→ ``agent_sub_stage``
+        （内含 ``try_capture_follow_up``）。而 ``on_waiting_llm_request``
+        是在 ``agent_sub_stage`` **内部**、``follow_up`` **之后**才触发的。
+
+        实测（webchat，模型首字延迟 124 秒）：
+
+        ```
+        23:27:10  测试第一句  → 进合并窗口 → 结算 → 开始长时间生成
+        23:27:34  连发A      → follow_up 捕获（+14ms）
+        23:27:50  连发B      → follow_up 捕获
+        ```
+
+        只要有一轮在生成，后续每条消息都会被 follow_up 抢走，
+        我们的合并窗口和打断逻辑**永远没机会执行**。
+
+        所以在 handler 阶段（更早）就把上一轮打断，让 follow_up
+        找不到活跃 runner，新消息自然走正常流程。
+        """
+        if not self._enabled() or not event.is_private_chat():
+            return
+        if not self._interrupt_enabled():
+            return
+        umo = event.unified_msg_origin
+        previous = self.state.in_flight.get(umo)
+        if previous is None or previous is event:
+            return
+        if not self._is_generating(previous):
+            return
+        # 这一轮在被 follow_up 接管之前先停掉它。
+        self._interrupt_in_flight(umo, event, previous=previous)
+        logger.info("[BetterChat] 抢在 follow_up 之前打断上一轮")
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=-1000)
     async def on_group_message(self, event: AstrMessageEvent) -> None:
         """群聊判定入口。
 

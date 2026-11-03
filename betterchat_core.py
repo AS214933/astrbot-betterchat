@@ -375,6 +375,17 @@ class MergeWindow:
                     return ReservationState.BYPASS
                 if latest.owner_ticket != reservation.ticket:
                     return ReservationState.SUPERSEDED
+                # 关键：可能刚好有更新的消息在超时**前一刻**登记，
+                # 但它的 wake.set() 还在事件循环里排队，没来得及唤醒我们。
+                # 这时直接 return OWNER 就会把那条消息漏在窗口外 ——
+                # 表现是「用户连发两句，Bot 只回了第一句」。
+                # 所以再算一次 deadline：如果它被推后了，说明有新消息，
+                # 回到循环顶部继续等。
+                if self._deadline(latest) > self._clock():
+                    # 有新消息刷新了窗口，继续等（同时让出控制权，
+                    # 让新登记的消息有机会完成它的 set()）。
+                    await asyncio.sleep(0)
+                    continue
                 return ReservationState.OWNER
             # 被新消息唤醒：回到循环顶部重算窗口与归属。
 

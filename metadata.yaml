@@ -2,7 +2,7 @@ name: astrbot_betterchat
 display_name: BetterChat
 desc: 私聊时耐心等待用户把话说完再合并成一条输入回复（生成中可被新消息打断），群聊时用 Jev 判断要不要插话。
 short_desc: 私聊耐心合并 + 群聊 Jev 决策插话
-version: 1.5.4
+version: 1.5.5
 author: AS214933
 repo: https://github.com/AS214933/astrbot-betterchat
 astrbot_version: ">=4.28.0"

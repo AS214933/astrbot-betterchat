@@ -422,14 +422,19 @@ class BetterChatPlugin(Star):
             if text and settings.should_ignore(text):
                 self._register_in_flight(umo, event)
                 return
-            # 如果 AstrBot 的 follow_up 会接走这条消息，就直接让路 ——
-            # 它会作为补充内容塞进正在跑的那一轮，我们再攒一份只会重复。
+            # 判断该「打断重来」还是「让 follow_up 并进当前回复」。
             #
-            # 实测踩过：用户连发 4 条，第 1 条先跑起来起了 runner，
-            # 第 4 条被 follow_up 接走，而我们窗口里还攒着 3 条 ——
-            # 合并文本缺了最后一句，Bot 回「能什么？话只说一半」。
-            if self._follow_up_will_take(umo, event):
-                logger.debug("[BetterChat] 交给 follow_up 处理，不参与合并")
+            # 顺序很重要，这里踩过坑：早期把 _follow_up_will_take 的检查
+            # 放在 _merge_turn **之前**，结果只要当前有活跃 runner，新消息
+            # 就永远走 follow_up 让路 —— **打断功能彻底失效**。
+            #
+            # 现在的规则：
+            #   * 打断开启时 → 先让 _merge_turn 处理（它会决定要不要打断）
+            #   * 打断关闭时 → 让路给 follow_up，别和它抢消息
+            if not self._interrupt_enabled() and self._follow_up_will_take(
+                umo, event
+            ):
+                logger.debug("[BetterChat] 打断已关闭，交给 follow_up 处理")
                 self._register_in_flight(umo, event)
                 return
             # 非纯文本（图片 / 表情 / 文件）也进入合并窗口，只是不参与
@@ -507,6 +512,20 @@ class BetterChatPlugin(Star):
             and self._is_generating(previous)
         ):
             self._interrupt_in_flight(umo, event, previous=previous)
+            # 打断场景必须**立即响应**，不能再去等合并窗口 ——
+            # 用户刚说完一条新的，期待的就是「马上重来」，
+            # 再等 4 秒等于白打断。
+            logger.info("[BetterChat] 打断上一轮，立即开始新回复")
+            merged, count = text, 1
+            turn = self.merge._turns.pop(umo, None)  # noqa: SLF001
+            if turn is not None:
+                # 丢弃本次登记的窗口，避免它到期后又触发一轮。
+                self.merge._settled[umo] = reservation.ticket  # noqa: SLF001
+            if merged:
+                self._replace_text(event, merged)
+            event.set_extra(EXTRA_TICKET, reservation.ticket)
+            self._let_astrbot_handle(event)
+            return True
 
         outcome = await self.merge.wait_for_quiet(
             umo,

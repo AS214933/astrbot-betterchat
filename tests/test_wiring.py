@@ -1461,6 +1461,89 @@ def test_follow_up_detection_is_defensive(loaded) -> None:
         _ACTIVE_AGENT_RUNNERS.pop("weird:umo", None)
 
 
+def test_interrupt_bypasses_merge_window(loaded) -> None:
+    """回归测试：打断必须**立即**生效，不能再去等合并窗口。
+
+    这里踩过连环坑：
+    1. 1.5.2 修了「窗口内互相打断」，但把打断逻辑也一起收窄了。
+    2. 1.5.3 又把 `_follow_up_will_take` 的检查放在 `_merge_turn` **之前**，
+       结果只要有活跃 runner，新消息永远走 follow_up 让路 ——
+       打断功能彻底失效。
+
+    现在：打断时跳过等待、立即放行；窗口内则照常合并。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 2.0,  # 故意设长：若打断还去等窗口，会明显超时
+            "min_quiet_seconds": 2.0,
+            "max_quiet_seconds": 2.0,
+            "total_seconds": 6.0,
+        }
+        config["interrupt"] = {"enable": True, "mode": "graceful"}
+        plugin = _isolated_plugin(loaded, config)
+
+        first = FakeEvent("第一句")
+        await plugin.on_waiting_llm(first)  # 等满窗口，结算并开始"生成"
+        assert first.get_extra("betterchat_ticket") is not None
+
+        import time
+
+        started = time.monotonic()
+        second = FakeEvent("第二句")
+        await plugin.on_waiting_llm(second)
+        elapsed = time.monotonic() - started
+
+        return first, second, elapsed
+
+    first, second, elapsed = run(scenario())
+
+    # 第一条被打断
+    assert first.get_extra("betterchat_stale") is True
+    # 第二条立即放行，没有去等 2 秒窗口
+    assert second.call_llm is False
+    assert second.get_extra("betterchat_ticket") is not None
+    assert elapsed < 1.0, f"打断应当立即生效，实际耗时 {elapsed:.2f}s"
+
+
+def test_window_messages_still_merge_without_interrupt(loaded) -> None:
+    """打断能力恢复后，窗口内连发仍然必须合并（不能一起退回"每条都打断"）。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.15,
+            "min_quiet_seconds": 0.15,
+            "max_quiet_seconds": 0.15,
+            "total_seconds": 0.5,
+        }
+        config["interrupt"] = {"enable": True, "mode": "graceful"}
+        plugin = _isolated_plugin(loaded, config)
+
+        tasks = []
+        for text in ("第一句", "第二句", "第三句"):
+            event = FakeEvent(text)
+            tasks.append((event, asyncio.create_task(plugin.on_waiting_llm(event))))
+            await asyncio.sleep(0.01)
+
+        for _e, task in tasks:
+            await asyncio.wait_for(task, timeout=3.0)
+        return tasks
+
+    tasks = run(scenario())
+    events = [e for e, _ in tasks]
+
+    # 只有一条走 LLM
+    winners = [e for e in events if e.call_llm is False]
+    assert len(winners) == 1, f"应当只回复一次，实际 {len(winners)}"
+    assert winners[0].message_str == "第一句\n第二句\n第三句"
+    # 不该有任何一条被打断
+    assert not any(e.get_extra("betterchat_stale") for e in events)
+
+
 # --------------------------------------------------------------------------- #
 # 生命周期
 # --------------------------------------------------------------------------- #

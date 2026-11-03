@@ -15,6 +15,46 @@
 
 ---
 
+## [1.5.5] - 2026-11-03
+
+### 修复
+
+- **打断生成功能完全失效**（关键，且是 1.5.3 引入的回归）。
+
+  1.5.3 为了不和 AstrBot 的 `follow_up` 抢消息，把
+  `_follow_up_will_take()` 的检查放在了 `_merge_turn()` **之前**：
+
+  ```python
+  if self._follow_up_will_take(umo, event):
+      return          # ← 打断逻辑在 _merge_turn 里，根本走不到
+  ```
+
+  而 `follow_up` 的条件是「该会话有活跃 runner 且发送者相同」——
+  **只要 Bot 在生成，用户发的每一条都会命中**，于是永远让路，
+  永不打断。用户诉求「生成中发新消息就停掉旧回复」形同虚设。
+
+  修复后的规则：
+
+  | 旧轮所处阶段 | 行为 |
+  |---|---|
+  | 还在合并窗口里 | 合并（不打断） |
+  | 已开始生成 | **打断**（立即重来） |
+
+  由 `_is_generating()`（看 `EXTRA_TICKET` 标记）区分。
+
+  同时补上一点：**打断时不等待合并窗口**。用户刚说完新的一句，
+  期待的是马上重来；如果再等 4 秒窗口，等于白打断。
+
+- `follow_up` 让路现在只在**打断关闭时**生效（作为"不和框架抢消息"的
+  降级路径），不再无条件优先。
+
+### 说明
+
+- 这条是 1.5.3 的回归，根因是修 A（缺最后一句）时没意识到
+  会掐死 B（打断）。两个需求都要，靠「旧轮处于哪个阶段」区分。
+
+---
+
 ## [1.5.4] - 2026-11-03
 
 ### 变更
@@ -506,7 +546,8 @@
 
 ---
 
-[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.4...HEAD
+[未发布]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.5...HEAD
+[1.5.5]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.4...v1.5.5
 [1.5.4]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.3...v1.5.4
 [1.5.3]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/AS214933/astrbot-betterchat/compare/v1.5.1...v1.5.2

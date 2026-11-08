@@ -268,6 +268,69 @@ def test_window_still_capped_by_total() -> None:
     assert settings.total_seconds >= settings.max_quiet_seconds
 
 
+def test_base_quiet_above_max_is_normalized() -> None:
+    """回归测试：基准不能被子配置的上限静默吃掉。
+
+    实测踩过：面板里把「基准」设成 5 秒，但「上限」留在 4 秒。
+    `clamp(5 + bonus, 1.5, 4)` 恒等于 4 —— 用户以为在等 5 秒，实际只有 4 秒。
+    结果两句间隔 4.37 秒的话，第一句在 4.00 秒就自己结算放行了
+    （差 0.37 秒），用户看到的是「怎么这么快就生成」。
+
+    规整后上限必须抬到至少能容纳基准。
+    """
+    settings = MergeSettings.from_config(
+        {
+            "base_quiet_seconds": 5.0,
+            "min_quiet_seconds": 1.5,
+            "max_quiet_seconds": 4.0,
+        }
+    )
+    assert settings.base_quiet_seconds == 5.0
+    assert settings.max_quiet_seconds >= 5.0, "上限被抬起来容纳基准"
+    # 用户设的 5 秒真的生效
+    assert quiet_seconds_for("Sticker", settings) >= 5.0
+
+
+def test_min_quiet_above_max_is_normalized() -> None:
+    settings = MergeSettings.from_config(
+        {
+            "base_quiet_seconds": 3.0,
+            "min_quiet_seconds": 8.0,
+            "max_quiet_seconds": 2.0,
+        }
+    )
+    assert settings.min_quiet_seconds <= settings.max_quiet_seconds
+    assert settings.base_quiet_seconds <= settings.max_quiet_seconds
+
+
+def test_base_quiet_below_min_is_normalized() -> None:
+    settings = MergeSettings.from_config(
+        {
+            "base_quiet_seconds": 0.5,
+            "min_quiet_seconds": 3.0,
+            "max_quiet_seconds": 6.0,
+        }
+    )
+    assert settings.min_quiet_seconds <= settings.base_quiet_seconds
+
+
+def test_three_values_always_consistent() -> None:
+    """任意组合下都必须满足 min <= base <= max。"""
+    import itertools
+
+    for base, low, high in itertools.product([0.5, 2.0, 5.0, 9.0], repeat=3):
+        settings = MergeSettings.from_config(
+            {
+                "base_quiet_seconds": base,
+                "min_quiet_seconds": low,
+                "max_quiet_seconds": high,
+            }
+        )
+        assert settings.min_quiet_seconds <= settings.base_quiet_seconds <= (
+            settings.max_quiet_seconds
+        ), f"不一致: 输入({base}, {low}, {high}) → {settings.min_quiet_seconds}, {settings.base_quiet_seconds}, {settings.max_quiet_seconds}"
+
+
 # --------------------------------------------------------------------------- #
 # 群聊 state 构造
 # --------------------------------------------------------------------------- #

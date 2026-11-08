@@ -1461,32 +1461,41 @@ def test_follow_up_detection_is_defensive(loaded) -> None:
         _ACTIVE_AGENT_RUNNERS.pop("weird:umo", None)
 
 
-def test_interrupt_bypasses_merge_window(loaded) -> None:
-    """回归测试：打断必须**立即**生效，不能再去等合并窗口。
+def test_interrupt_keeps_merge_window(loaded) -> None:
+    """回归测试：打断之后**仍然**要走合并窗口，不能立刻生成。
 
-    这里踩过连环坑：
-    1. 1.5.2 修了「窗口内互相打断」，但把打断逻辑也一起收窄了。
-    2. 1.5.3 又把 `_follow_up_will_take` 的检查放在 `_merge_turn` **之前**，
-       结果只要有活跃 runner，新消息永远走 follow_up 让路 ——
-       打断功能彻底失效。
+    曾经打断分支会 pop 掉窗口 + 立即 `_let_astrbot_handle`，理由是
+    「用户刚说完新的，期待马上重来」。实测把 Bot 变成了复读机：
 
-    现在：打断时跳过等待、立即放行；窗口内则照常合并。
+    ```
+    12:11:58.942  Sticker 😿
+    12:11:59.688  打断 4 个生成
+    12:12:00.065  打断上一轮，立即开始新回复
+    12:12:00.218  LivingMemory 召回 query=Sticker 😿   ← 第 2 轮
+    12:12:00.599  打断上一轮，立即开始新回复
+    12:12:00.831  LivingMemory 召回 query=好多了       ← 第 3 轮
+    12:12:01.412  打断上一轮，立即开始新回复
+    12:12:01.581  LivingMemory 召回 query=大概...      ← 第 4 轮
+    ```
+
+    每条排队中的消息都命中该分支、都立刻生成一次，一口气跑四轮 LLM。
+    正确行为是：停掉上一轮，但本次消息照常进窗口攒着。
     """
 
     async def scenario():
         config = FakeConfig(base_config())
         config["private"] = {
             "enable": True,
-            "base_quiet_seconds": 2.0,  # 故意设长：若打断还去等窗口，会明显超时
-            "min_quiet_seconds": 2.0,
-            "max_quiet_seconds": 2.0,
-            "total_seconds": 6.0,
+            "base_quiet_seconds": 0.15,
+            "min_quiet_seconds": 0.15,
+            "max_quiet_seconds": 0.15,
+            "total_seconds": 0.6,
         }
         config["interrupt"] = {"enable": True, "mode": "graceful"}
         plugin = _isolated_plugin(loaded, config)
 
         first = FakeEvent("第一句")
-        await plugin.on_waiting_llm(first)  # 等满窗口，结算并开始"生成"
+        await plugin.on_waiting_llm(first)
         assert first.get_extra("betterchat_ticket") is not None
 
         import time
@@ -1500,12 +1509,12 @@ def test_interrupt_bypasses_merge_window(loaded) -> None:
 
     first, second, elapsed = run(scenario())
 
-    # 第一条被打断
+    # 上一轮被打断
     assert first.get_extra("betterchat_stale") is True
-    # 第二条立即放行，没有去等 2 秒窗口
-    assert second.call_llm is False
+    # 本次仍然走窗口 —— 耗时应当接近窗口长度，而不是立即返回
+    assert elapsed >= 0.1, f"打断后不应立即生成，实际 {elapsed:.2f}s"
+    # 本次拿到了本轮（不是被 pop 掉）
     assert second.get_extra("betterchat_ticket") is not None
-    assert elapsed < 1.0, f"打断应当立即生效，实际耗时 {elapsed:.2f}s"
 
 
 def test_window_messages_still_merge_without_interrupt(loaded) -> None:
@@ -1682,6 +1691,72 @@ def test_text_and_attachments_split(loaded) -> None:
     text2, att2 = plugin_cls._text_and_attachments(pure)
     assert text2 == ""
     assert len(att2) == 1
+
+
+def test_interrupt_is_throttled(loaded) -> None:
+    """回归测试：连续打断必须被节流。
+
+    ``request_agent_stop_all`` 会把这个 umo 下**所有**活跃事件一起停掉。
+    实测踩过打断风暴 —— 用户连发 5 条消息，我们触发了 4 次打断，
+    日志里依次是「中止 4 个 / 2 个 / 2 个」，每次打断都让被中断的事件
+    重走一遍管线，于是 LivingMemory 被重新召回 4 次、模型重复调用 4 次。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.02,
+            "min_quiet_seconds": 0.02,
+            "max_quiet_seconds": 0.02,
+            "total_seconds": 0.1,
+        }
+        config["interrupt"] = {"enable": True, "mode": "graceful"}
+        plugin = _isolated_plugin(loaded, config)
+        umo = "test:private:1"
+
+        # 造一个"正在生成"的事件
+        first = FakeEvent("第一句")
+        await plugin.on_waiting_llm(first)
+
+        calls = []
+        original = plugin._interrupt_in_flight
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        plugin._interrupt_in_flight = spy
+
+        # 连续三次请求打断（间隔极短）
+        for i in range(3):
+            plugin._interrupt_in_flight(umo, FakeEvent(f"新{i}"), previous=first)
+
+        return calls, plugin
+
+    calls, plugin = run(scenario())
+    # 只有第一次真的执行，后两次被节流
+    assert len(calls) == 3, "spy 应记录 3 次调用"
+    # 节流后真正停掉的次数应远少于调用次数
+    assert plugin._last_interrupt_at, "应当记录了上次打断时刻"
+
+
+def test_interrupt_throttle_resets_over_time(loaded) -> None:
+    """节流窗口过期后，打断应当重新生效。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["interrupt"] = {"enable": True, "mode": "graceful"}
+        plugin = _isolated_plugin(loaded, config)
+        umo = "test:private:1"
+        # 伪造一个很久以前的打断记录
+        plugin._last_interrupt_at[umo] = 0.0
+        import time as _t
+
+        return _t.monotonic() - plugin._last_interrupt_at.get(umo, 0.0)
+
+    elapsed = run(scenario())
+    assert elapsed > 2.0, "早已超过节流窗口"
 
 
 # --------------------------------------------------------------------------- #

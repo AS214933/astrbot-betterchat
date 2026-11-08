@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from typing import Any
 
 try:  # 包内导入（AstrBot 正常加载方式）
@@ -107,6 +108,12 @@ __all__ = ["BetterChatPlugin"]
 #: （AstrBot 在每个 handler 之间会 ``clear_result()``，所以不能用 stop 标记）。
 EXTRA_TICKET = "betterchat_ticket"
 EXTRA_STALE = "betterchat_stale"
+#: 两次打断之间的最小间隔。``request_agent_stop_all`` 会把该会话下**所有**
+#: 活跃事件一起停掉，实测用户连发 5 条时我们触发了 4 次打断，
+#: 每次都被中断的事件重走一遍管线（LivingMemory 重新召回 4 次、
+#: 模型重复调用 4 次）。没有新消息时打断一次就够了。
+_INTERRUPT_THROTTLE_SECONDS = 2.0
+
 EXTRA_GROUP_VERDICT = "betterchat_group_verdict"
 EXTRA_REPLIED = "betterchat_replied"
 """这一轮的回复已经放行发送了 —— 不该再被当成"可打断的目标"。"""
@@ -176,6 +183,8 @@ class BetterChatPlugin(Star):
         self._silence_tasks: dict[str, asyncio.Task] = {}
         #: 每群一个"观望待帮"的任务：有问题没人接时先等着，有人接话就取消。
         self._help_tasks: dict[str, asyncio.Task] = {}
+        #: 每个会话上次打断的时刻，用于节流（见 _INTERRUPT_THROTTLE_SECONDS）。
+        self._last_interrupt_at: dict[str, float] = {}
 
         self._log_startup()
 
@@ -391,7 +400,26 @@ class BetterChatPlugin(Star):
         *,
         previous: AstrMessageEvent | None = None,
     ) -> None:
-        """中止本会话里正在进行的生成。"""
+        """中止本会话里正在进行的生成。
+
+        节流：``request_agent_stop_all`` 会把这个 umo 下**所有**活跃事件
+        一起停掉。实测踩过打断风暴 —— 用户连发 5 条消息，我们触发了
+        4 次打断，日志里依次是「中止 4 个 / 2 个 / 2 个」，
+        每次打断都让被中断的事件重走一遍管线，于是 LivingMemory
+        被重新召回 4 次、模型被重复调用 4 次，纯属浪费。
+
+        没有新消息到达时，打断一次就够了：该停的已经停了，
+        再停一次只会在已经结束的事件上做无用功。
+        """
+        now = time.monotonic()
+        last = self._last_interrupt_at.get(umo, 0.0)
+        if now - last < _INTERRUPT_THROTTLE_SECONDS:
+            logger.debug(
+                f"[BetterChat] 打断节流（距上次 {now - last:.2f}s），跳过"
+            )
+            return
+        self._last_interrupt_at[umo] = now
+
         try:
             from astrbot.core.utils.active_event_registry import (
                 active_event_registry,
@@ -536,21 +564,27 @@ class BetterChatPlugin(Star):
             and previous_ticket != reservation.ticket
             and self._is_generating(previous)
         ):
+            # 只做一件事：停掉上一轮。**不再**顺手丢弃窗口、立刻放行本次事件。
+            #
+            # 曾经这里 pop 掉窗口并 `_let_astrbot_handle` 立即返回，理由是
+            # 「用户刚说完新的，期待马上重来」。实测把 Bot 变成了复读机：
+            #
+            #   12:11:58.942  Sticker 😿
+            #   12:11:59.688  打断 4 个生成
+            #   12:12:00.065  打断上一轮，立即开始新回复
+            #   12:12:00.218  LivingMemory 召回 query=Sticker 😿   ← 第 2 轮
+            #   12:12:00.599  打断上一轮，立即开始新回复
+            #   12:12:00.831  LivingMemory 召回 query=好多了       ← 第 3 轮
+            #   12:12:01.412  打断上一轮，立即开始新回复
+            #   12:12:01.581  LivingMemory 召回 query=大概...      ← 第 4 轮
+            #
+            # 每条排队中的消息都命中这个分支、都立刻生成一次，一口气跑了四轮
+            # LLM、四次记忆召回。而用户真正想要的是「停掉旧的那轮，
+            # 把我说的话攒起来一起回」。
+            #
+            # 所以：打断之后照常走合并窗口，攒够了再一次性生成。
             self._interrupt_in_flight(umo, event, previous=previous)
-            # 打断场景必须**立即响应**，不能再去等合并窗口 ——
-            # 用户刚说完一条新的，期待的就是「马上重来」，
-            # 再等 4 秒等于白打断。
-            logger.info("[BetterChat] 打断上一轮，立即开始新回复")
-            merged, count = text, 1
-            turn = self.merge._turns.pop(umo, None)  # noqa: SLF001
-            if turn is not None:
-                # 丢弃本次登记的窗口，避免它到期后又触发一轮。
-                self.merge._settled[umo] = reservation.ticket  # noqa: SLF001
-            if merged:
-                self._replace_text(event, merged)
-            event.set_extra(EXTRA_TICKET, reservation.ticket)
-            self._let_astrbot_handle(event)
-            return True
+            logger.info("[BetterChat] 打断上一轮，本次消息继续走合并窗口")
 
         outcome = await self.merge.wait_for_quiet(
             umo,

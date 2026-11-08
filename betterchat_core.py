@@ -129,9 +129,22 @@ class MergeSettings:
 
         min_quiet = _as_float(section.get("min_quiet_seconds", 2.5), 2.5)
         max_quiet = _as_float(section.get("max_quiet_seconds", 6.0), 6.0)
-        # 下限永远不能超过上限，否则 clamp 会失效；这里做一次规整。
+        base_quiet = _as_float(section.get("base_quiet_seconds", 4.0), 4.0)
+
+        # 三个值互相约束，任何一对反过来都会让 clamp 静默吃掉用户设的值。
+        #
+        # 实测踩过：用户在面板把「基准」设成 5 秒，却把「上限」留在 4 秒。
+        # `clamp(5 + bonus, 1.5, 4)` 恒等于 4 —— 用户以为在等 5 秒，
+        # 实际只有 4 秒。结果两句间隔 4.37 秒的话，第一句在 4.00 秒就
+        # 自己结算放行了（差 0.37 秒），用户看到的是"怎么这么快就生成"。
+        #
+        # 这里把上限抬到至少能容纳基准，保证用户设的基准真的生效。
         if max_quiet < min_quiet:
             max_quiet = min_quiet
+        if max_quiet < base_quiet:
+            max_quiet = base_quiet
+        if base_quiet < min_quiet:
+            min_quiet = base_quiet
 
         prefixes = section.get("ignore_prefixes", ["/", "!"])
         if not isinstance(prefixes, (list, tuple)):
@@ -140,7 +153,7 @@ class MergeSettings:
 
         return cls(
             enable=bool(section.get("enable", True)),
-            base_quiet_seconds=_as_float(section.get("base_quiet_seconds", 4.0), 4.0),
+            base_quiet_seconds=base_quiet,
             min_quiet_seconds=min_quiet,
             max_quiet_seconds=max_quiet,
             total_seconds=max(0.1, _as_float(section.get("total_seconds", 12.0), 12.0)),

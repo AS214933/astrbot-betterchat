@@ -1759,6 +1759,72 @@ def test_interrupt_throttle_resets_over_time(loaded) -> None:
     assert elapsed > 2.0, "早已超过节流窗口"
 
 
+def test_interrupt_inherits_discarded_turn_content(loaded) -> None:
+    """回归测试：打断后必须继承上一轮已结算的内容。
+
+    没有继承的话，用户前面说的话全丢。实测：
+
+    ```
+    12:23:55.323  合并 2 条（15 字符 + 1 附件）   ← 贴纸 + 和我贴贴
+    12:23:55.768  打断 4 个生成
+    12:23:56.715  LM 召回 query=有点笨笨的       ← 只剩这一条！
+    12:24:01.573  合并 2 条（10 字符）           ← 又单独合并一次
+    ```
+
+    Bot 只看得到「有点笨笨的」，完全不知道刚才在聊贴贴。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.1,
+            "min_quiet_seconds": 0.1,
+            "max_quiet_seconds": 0.1,
+            "total_seconds": 0.6,
+        }
+        config["interrupt"] = {"enable": True, "mode": "graceful"}
+        plugin = _isolated_plugin(loaded, config)
+
+        # 第一轮：文字 + 贴纸，结算后"开始生成"
+        a = FakeEvent("和我贴贴")
+        a.message_obj.message = [_Plain("和我贴贴"), _Image("a.png")]
+        ta = asyncio.create_task(plugin.on_waiting_llm(a))
+        await asyncio.sleep(0.02)
+        b = FakeEvent("suki")
+        tb = asyncio.create_task(plugin.on_waiting_llm(b))
+        await asyncio.gather(ta, tb)
+        first_winner = [e for e in (a, b) if e.call_llm is False]
+        assert first_winner, "第一轮应当有一条胜出"
+
+        # 第二轮：新消息触发打断 + 继承
+        c = FakeEvent("有点笨笨的")
+        tc = asyncio.create_task(plugin.on_waiting_llm(c))
+        await asyncio.sleep(0.02)
+        d = FakeEvent("喜欢你")
+        td = asyncio.create_task(plugin.on_waiting_llm(d))
+        await asyncio.gather(tc, td)
+
+        return first_winner[0], [e for e in (c, d) if e.call_llm is False]
+
+    _first, second_winner = run(scenario())
+    assert second_winner, "第二轮应当有一条胜出"
+
+    merged = second_winner[0].message_str
+    # 第一轮的内容必须还在，且在**前面**（时间顺序）
+    assert "和我贴贴" in merged, f"第一轮内容丢失: {merged!r}"
+    assert "suki" in merged, f"第一轮内容丢失: {merged!r}"
+    assert merged.index("和我贴贴") < merged.index("有点笨笨的"), (
+        f"继承内容应排在前面，实际: {merged!r}"
+    )
+    # 贴纸也要继承过来
+    kinds = [
+        str(getattr(getattr(x, "type", None), "value", ""))
+        for x in second_winner[0].message_obj.message
+    ]
+    assert "Image" in kinds, f"贴纸丢了: {kinds}"
+
+
 # --------------------------------------------------------------------------- #
 # 生命周期
 # --------------------------------------------------------------------------- #

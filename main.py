@@ -393,6 +393,29 @@ class BetterChatPlugin(Star):
         except Exception:  # noqa: BLE001
             return False
 
+    def _inherit_interrupted_turn(self, umo: str) -> None:
+        """把被打断那一轮已结算的内容接管回当前窗口。
+
+        没有这一步，用户前面说的话就白说了 —— 实测：
+        「贴贴」「suki」合并后开始生成，被打断时那批内容已经离开窗口，
+        新一轮只剩「有点笨笨的」一条，Bot 完全不知道前面聊了什么。
+        """
+        try:
+            previous = self.merge.take_last_settled(umo)
+        except Exception:  # noqa: BLE001
+            return
+        if previous is None:
+            return
+        text, _count, attachments = previous
+        if not text and not attachments:
+            return
+        parts = [text] if text else []
+        self.merge.seed(umo, parts, attachments)
+        logger.info(
+            f"[BetterChat] 继承被中断的内容（{len(text)} 字符 + "
+            f"{len(attachments)} 个附件）"
+        )
+
     def _interrupt_in_flight(
         self,
         umo: str,
@@ -575,15 +598,17 @@ class BetterChatPlugin(Star):
             #   12:12:00.218  LivingMemory 召回 query=Sticker 😿   ← 第 2 轮
             #   12:12:00.599  打断上一轮，立即开始新回复
             #   12:12:00.831  LivingMemory 召回 query=好多了       ← 第 3 轮
-            #   12:12:01.412  打断上一轮，立即开始新回复
-            #   12:12:01.581  LivingMemory 召回 query=大概...      ← 第 4 轮
             #
-            # 每条排队中的消息都命中这个分支、都立刻生成一次，一口气跑了四轮
-            # LLM、四次记忆召回。而用户真正想要的是「停掉旧的那轮，
-            # 把我说的话攒起来一起回」。
+            # 每条排队中的消息都命中这个分支、都立刻生成一次，一口气跑了四轮。
             #
-            # 所以：打断之后照常走合并窗口，攒够了再一次性生成。
+            # 现在：停掉上一轮，并把**上一轮已经攒下但被丢弃的内容**接管回来，
+            # 和新消息一起继续等窗口。否则用户前面说的话就白说了：
+            #
+            #   12:23:55.323  合并 2 条（15 字符 + 1 附件）  ← 贴纸 + 和我贴贴
+            #   12:23:55.768  打断
+            #   12:23:56.715  LM 召回 query=有点笨笨的      ← 只剩这一条！
             self._interrupt_in_flight(umo, event, previous=previous)
+            self._inherit_interrupted_turn(umo)
             logger.info("[BetterChat] 打断上一轮，本次消息继续走合并窗口")
 
         outcome = await self.merge.wait_for_quiet(
@@ -601,7 +626,7 @@ class BetterChatPlugin(Star):
             self._take_over_turn(event)
             return False
 
-        settled = await self.merge.settle(umo, reservation)
+        settled = await self.merge.settle_and_remember(umo, reservation)
         if settled is None:
             self._take_over_turn(event)
             return False

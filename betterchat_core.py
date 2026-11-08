@@ -252,6 +252,10 @@ class MergeWindow:
         self.settings = settings or MergeSettings()
         self._turns: dict[str, _PendingTurn] = {}
         self._settled: dict[str, int] = {}
+        self._last_settled: dict[
+            str, tuple[str, int, list[object]]
+        ] = {}
+        """每个会话最近一次结算的内容，供打断后继承。"""
         """每个会话最近一次被结算的 ticket，用于让「慢半拍」的等待者
         正确判定为 SUPERSEDED 而不是误判成新会话。"""
         self._next_ticket = 0
@@ -432,6 +436,77 @@ class MergeWindow:
             merged = merge_texts(turn.parts, max_chars=self.settings.max_chars)
             return merged, turn.count, list(turn.attachments)
 
+    async def settle_and_remember(
+        self, session_key: str, reservation: Reservation
+    ) -> tuple[str, int, list[object]] | None:
+        """同 :meth:`settle`，只是额外把内容记下来供打断继承。
+
+        为什么需要：一次合并结算后，那批消息就交给 LLM 去生成了。
+        如果这时用户又发新的、我们决定打断，**那批内容已经不在窗口里** ——
+        不继承的话，新的一轮只包含打断之后的消息，用户之前说的话全丢了。
+
+        实测踩过：
+        ```
+        12:23:55.323  合并 2 条（15 字符 + 1 附件）   ← 贴纸 + 和我贴贴
+        12:23:55.768  打断 4 个生成
+        12:23:56.715  LM 召回 query=有点笨笨的       ← 只剩这一条！
+        12:24:01.573  合并 2 条（10 字符）           ← 又单独合并一次
+        ```
+        用户发的「贴贴」「suki」全被丢了，Bot 只看得到「有点笨笨的」。
+        """
+        async with self._lock:
+            result = self._settle_locked(session_key, reservation)
+            if result is not None:
+                self._last_settled[session_key] = result
+            return result
+
+    def _settle_locked(
+        self, session_key: str, reservation: Reservation
+    ) -> tuple[str, int, list[object]] | None:
+        """调用方必须已持有 ``_lock``。"""
+        turn = self._turns.get(session_key)
+        if turn is None or turn.owner_ticket != reservation.ticket:
+            return None
+        self._turns.pop(session_key, None)
+        self._settled[session_key] = reservation.ticket
+        merged = merge_texts(turn.parts, max_chars=self.settings.max_chars)
+        return merged, turn.count, list(turn.attachments)
+
+    def take_last_settled(
+        self, session_key: str
+    ) -> tuple[str, int, list[object]] | None:
+        """取走并清空「上一轮已结算的内容」。"""
+        return self._last_settled.pop(session_key, None)
+
+    def seed(
+        self,
+        session_key: str,
+        parts: Sequence[str],
+        attachments: Sequence[object] | None = None,
+    ) -> None:
+        """把内容预置进当前窗口（用于打断后继承上一轮）。
+
+        必须插在**最前面**：继承来的是用户更早说的话，语义上先于刚刚
+        触发打断的这一条。追加到末尾会把时间顺序搞反，实测得到
+        ``有点笨笨的\\n和我贴贴\\nsuki`` —— 读起来完全不通。
+        """
+        if not parts and not attachments:
+            return
+        now = self._clock()
+        turn = self._turns.get(session_key)
+        if turn is None:
+            turn = _PendingTurn(created_at=now)
+            self._turns[session_key] = turn
+        turn.parts[:0] = list(parts)
+        inherited = [c for c in (attachments or ()) if c is not None]
+        if inherited:
+            turn.attachments[:0] = inherited
+        turn.count += max(1, len(parts))
+        turn.latest_at = now
+        turn.version += 1
+        turn.wake.set()
+        turn.wake = asyncio.Event()
+
 
 class GroupAggregator:
     """群聊「判定前」的短暂聚合窗口。
@@ -457,6 +532,10 @@ class GroupAggregator:
         self._clock = clock
         self._turns: dict[str, _GroupTurn] = {}
         self._settled: dict[str, int] = {}
+        self._last_settled: dict[
+            str, tuple[str, int, list[object]]
+        ] = {}
+        """每个会话最近一次结算的内容，供打断后继承。"""
         self._next_ticket = 0
         self._lock = asyncio.Lock()
         self._closed = False

@@ -263,22 +263,25 @@
       "channel": {
         "type": "string",
         "description": "渠道",
-        "hint": "三个渠道的模型版本可能不同步，切换后请看日志确认实际生效的 endpoint 与模型。OpenCode 渠道用 oc_sk_ 开头的 Console key；jev-1.13-free 是限时免费，有未公开的用量上限，用尽后需等待重置或改用付费 jev-1.13。",
+        "hint": "四个渠道的模型版本可能不同步，切换后看日志确认实际 endpoint 与模型。注意：Command Code 的 Go 计划（$1/mo）没有 API 权限，需 GOAT 或更高。",
         "default": "official",
         "options": [
           "official",
           "cloudflare",
-          "opencode"
+          "opencode",
+          "commandcode"
         ],
         "labels": [
           "TypeSafe 官方",
           "Cloudflare Workers AI",
-          "OpenCode Zen"
+          "OpenCode Zen",
+          "Command Code"
         ],
         "subtitles": [
-          "直连 api.typesafe.ai，默认 jev-latest。最省心的免费路径",
-          "经 Cloudflare 转发；免费 Neurons 不覆盖第三方模型，需预付额度",
-          "OpenCode 的 jev（免费版 jev-1.13-free 可直接用，需 Console key）"
+          "直连 api.typesafe.ai，默认 jev-latest。最省心",
+          "经 Cloudflare 转发；免费 Neurons 不覆盖第三方模型",
+          "OpenCode 的 jev；免费版 jev-1.13-free 可用，有未公开上限",
+          "Command Code Provider API；GOAT 及以上计划可用"
         ]
       },
       "api_key": {
@@ -337,6 +340,25 @@
         "description": "OpenCode 模型",
         "hint": "jev-1.13-free（限时免费，推荐）或 jev-1.13（需账户余额）。注意免费模型有未公开的用量上限，用尽后需等待重置。",
         "default": "jev-1.13-free"
+      },
+      "cc_api_key": {
+        "type": "string",
+        "description": "Command Code API Key",
+        "hint": "Command Code Studio → API keys 创建（user_ 开头）。同一把 key 同时用于 CLI 和 API。",
+        "default": "",
+        "secret": true
+      },
+      "cc_api_base": {
+        "type": "string",
+        "description": "Command Code API 地址",
+        "hint": "一般无需修改。默认 https://api.commandcode.ai/provider/v1，插件会自动补 /systemone。",
+        "default": "https://api.commandcode.ai/provider/v1"
+      },
+      "cc_model": {
+        "type": "string",
+        "description": "Command Code 模型",
+        "hint": "填 typesafe/jev。要固定版本可以写 typesafe/jev-1.14.0。",
+        "default": "typesafe/jev"
       },
       "timeout_seconds": {
         "type": "float",

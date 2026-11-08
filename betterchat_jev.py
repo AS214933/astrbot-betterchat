@@ -61,6 +61,11 @@ DEFAULT_CF_BASE = "https://api.cloudflare.com/client/v4/accounts"
 #: * ``OpenCode Go`` 订阅里**没有 Jev**（78 个模型无一含 jev；打 Go 路由返回
 #:   ``Model is unavailable``），所以不为 Go 单独做渠道。
 DEFAULT_OC_BASE = "https://opencode.ai/inference/systemone/v1"
+#: Command Code 的 Provider API。它的 ``/provider/v1/systemone`` 与 TypeSafe
+#: 官方**完全同构**（同样的 ``{model, state, questions}`` → ``{answers}``），
+#: 只是换了域名和鉴权，所以请求体不需要任何转换。
+DEFAULT_CC_BASE = "https://api.commandcode.ai/provider/v1"
+DEFAULT_CC_MODEL = "typesafe/jev"
 DEFAULT_OC_MODEL = "jev-1.13-free"
 
 #: 调用 OpenCode 时必须携带的 User-Agent。
@@ -98,6 +103,9 @@ class JevConfig:
     oc_api_key: str = ""
     oc_api_base: str = DEFAULT_OC_BASE
     oc_model: str = DEFAULT_OC_MODEL
+    cc_api_key: str = ""
+    cc_api_base: str = DEFAULT_CC_BASE
+    cc_model: str = DEFAULT_CC_MODEL
     timeout_seconds: float = 3.0
     max_concurrency: int = 4
     breaker_failures: int = 3
@@ -127,7 +135,7 @@ class JevConfig:
                 return default
 
         channel = text("channel", "official").lower()
-        if channel not in ("official", "cloudflare", "opencode"):
+        if channel not in ("official", "cloudflare", "opencode", "commandcode"):
             channel = "official"
 
         cf_model = text("cf_model", DEFAULT_CF_MODEL) or DEFAULT_CF_MODEL
@@ -148,6 +156,9 @@ class JevConfig:
             oc_api_key=text("oc_api_key", ""),
             oc_api_base=text("oc_api_base", DEFAULT_OC_BASE) or DEFAULT_OC_BASE,
             oc_model=text("oc_model", DEFAULT_OC_MODEL) or DEFAULT_OC_MODEL,
+            cc_api_key=text("cc_api_key", ""),
+            cc_api_base=text("cc_api_base", DEFAULT_CC_BASE) or DEFAULT_CC_BASE,
+            cc_model=text("cc_model", DEFAULT_CC_MODEL) or DEFAULT_CC_MODEL,
             timeout_seconds=max(0.1, number("timeout_seconds", 3.0)),
             max_concurrency=max(1, integer("max_concurrency", 4)),
             breaker_failures=max(1, integer("breaker_failures", 3)),
@@ -173,6 +184,10 @@ class JevConfig:
             if not self.cf_api_token:
                 missing.append("cf_api_token")
             return f"缺少配置: {', '.join(missing)}" if missing else None
+        if self.channel == "commandcode":
+            if self.cc_api_key:
+                return None
+            return "缺少配置: cc_api_key（cmd code 的 API key，Studio → API keys 创建）"
         if self.channel == "opencode":
             if self.oc_api_key:
                 return None
@@ -201,6 +216,13 @@ class JevConfig:
             account = self.cf_account_id.strip()
             return f"{DEFAULT_CF_BASE}/{account}/ai/run"
 
+        if self.channel == "commandcode":
+            # Provider API 的 systemone 与官方同构，直接拼 /systemone。
+            base = self.cc_api_base.strip().rstrip("/")
+            if base.endswith("/systemone"):
+                return base
+            return base + "/systemone"
+
         if self.channel == "opencode":
             # models.dev 的 jev-1.13-free.toml 给出的 base_url 是
             # https://opencode.ai/inference/systemone/v1，System One 路径是 /systemone。
@@ -220,6 +242,8 @@ class JevConfig:
         """当前渠道实际生效的模型名（用于日志与诊断输出）。"""
         if self.channel == "cloudflare":
             return self.cf_model
+        if self.channel == "commandcode":
+            return self.cc_model
         if self.channel == "opencode":
             return self.oc_model
         return self.model
@@ -227,6 +251,8 @@ class JevConfig:
     def auth_token(self) -> str:
         if self.channel == "cloudflare":
             return self.cf_api_token
+        if self.channel == "commandcode":
+            return self.cc_api_key
         if self.channel == "opencode":
             return self.oc_api_key
         return self.api_key
@@ -410,6 +436,9 @@ class JevClient:
             # Cloudflare 的通用入口 /ai/run 需要把模型名放在请求体里，
             # 并把真正的参数包在 "input" 里（与官方渠道的裸 body 不同）。
             return {"model": self.config.cf_model, "input": body}
+        if self.config.channel == "commandcode":
+            # 与官方 TypeSafe 完全同构：model 平铺在 body 里。
+            return {"model": self.config.cc_model, **body}
         if self.config.channel == "opencode":
             # OpenCode 的 System One 端点与官方同构：model 平铺在 body 里。
             return {"model": self.config.oc_model, **body}
@@ -607,6 +636,28 @@ def _explain_http_error(*, status: int, body: str, channel: str) -> str:
                 f"Cloudflare 找不到该模型（HTTP {status}）。"
                 "请确认 cf_model 填的是 typesafe/jev（不带 @cf/）。原始响应: "
                 f"{summary}"
+            )
+
+    if channel == "commandcode":
+        # 403 upgrade_required：Go 计划是唯一没有 API 权限的档位。
+        if "upgrade_required" in body or status == 403:
+            return (
+                f"Command Code 拒绝请求（HTTP {status}）。"
+                "Go 计划（$1/mo）是唯一**没有 API 权限**的档位，"
+                "GOAT / Pro / Max / Team / Provider 才有。"
+                "请升级到 GOAT 或更高，或改用其他渠道。"
+                f"原始响应: {summary}"
+            )
+        if "unsupported_model" in body:
+            return (
+                f"Command Code 不认这个模型（HTTP {status}）。"
+                "jev 应该填 `typesafe/jev`，也可以固定版本如 "
+                f"`typesafe/jev-1.14.0`。原始响应: {summary}"
+            )
+        if status == 401 or "authentication_error" in body:
+            return (
+                f"Command Code 认证失败（HTTP {status}），请检查 cc_api_key。"
+                f"原始响应: {summary}"
             )
 
     if channel == "opencode":

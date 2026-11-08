@@ -791,6 +791,199 @@ def test_opencode_session_id_is_stable_across_calls() -> None:
     assert run(scenario()) != first
 
 
+def test_commandcode_channel_matches_official_shape() -> None:
+    """Command Code 的 systemone 与 TypeSafe 官方**完全同构**。
+
+    文档明确：`/provider/v1/systemone` 的请求/响应都遵循 TypeSafe 的
+    System One 形状（`{model, state, questions}` → `{answers}`），
+    只是换了域名和鉴权。所以只需要转 transport，不需要转 body。
+    """
+    config = JevConfig.from_config(
+        {
+            "channel": "commandcode",
+            "cc_api_key": "user_test",
+            "cc_model": "typesafe/jev",
+        }
+    )
+    assert config.endpoint() == "https://api.commandcode.ai/provider/v1/systemone"
+    assert config.active_model() == "typesafe/jev"
+    assert config.ready_missing() is None
+
+    async def scenario():
+        client = JevClient(config)
+        captured = install_fake_post(
+            client,
+            {"model": "typesafe/jev", "answers": {"should_reply": {"type": "noul", "noul": 0.7}}},
+        )
+        await client.decide(state={"a": 1}, questions=QUESTIONS)
+        return captured
+
+    captured = run(scenario())
+    assert captured.payload is not None
+    # 与官方一致：model 平铺，不套 input。
+    assert set(captured.payload) == {"model", "state", "questions"}
+    assert captured.payload["model"] == "typesafe/jev"
+
+
+def test_commandcode_requires_key() -> None:
+    assert JevConfig.from_config({"channel": "commandcode"}).ready_missing() is not None
+
+
+def test_commandcode_pinned_version() -> None:
+    """可以固定版本号，文档说同样的请求形状同样的价格。"""
+    config = JevConfig.from_config(
+        {
+            "channel": "commandcode",
+            "cc_api_key": "k",
+            "cc_model": "typesafe/jev-1.14.0",
+        }
+    )
+    assert config.active_model() == "typesafe/jev-1.14.0"
+
+
+def test_commandcode_upgrade_required_is_explained() -> None:
+    """403 upgrade_required：Go 计划没有 API 权限，提示要升级。"""
+    from betterchat_jev import _explain_http_error
+
+    message = _explain_http_error(
+        status=403,
+        body='{"error":{"code":"upgrade_required"}}',
+        channel="commandcode",
+    )
+    assert "Go 计划" in message
+    assert "GOAT" in message
+
+
+def test_commandcode_unsupported_model_is_explained() -> None:
+    from betterchat_jev import _explain_http_error
+
+    message = _explain_http_error(
+        status=400, body='{"code":"unsupported_model"}', channel="commandcode"
+    )
+    assert "typesafe/jev" in message
+
+
+def test_commandcode_base_with_full_path() -> None:
+    """用户把完整 endpoint 填进来时不要重复拼接。"""
+    config = JevConfig.from_config(
+        {
+            "channel": "commandcode",
+            "cc_api_key": "k",
+            "cc_api_base": "https://api.commandcode.ai/provider/v1/systemone",
+        }
+    )
+    assert config.endpoint().count("/systemone") == 1
+
+
+def test_post_sends_request_not_payload_dict() -> None:
+    """回归测试：``_post`` 必须真的发 HTTP 请求。
+
+    曾经有个 bug：手工替换代码时把 ``_build_payload`` 的分支误插进了
+    ``_post``，导致 ``_post`` 在发请求前直接 ``return`` 了一个 dict ——
+    整个渠道静默失效，而且单元测试全部通过（因为它们都 monkeypatch 了
+    ``_post``）。这个用例盯住「_post 真的会走到 session.post」。
+    """
+    config = JevConfig.from_config(
+        {"channel": "commandcode", "cc_api_key": "user_k", "cc_model": "typesafe/jev"}
+    )
+
+    class FakeResponse:
+        status = 200
+
+        async def json(self, **_kw):
+            return {"model": "typesafe/jev", "answers": {"should_reply": {"type": "noul", "noul": 0.6}}}
+
+        async def text(self):
+            return ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        closed = False
+
+        def __init__(self) -> None:
+            self.called = False
+            self.url = None
+            self.payload = None
+
+        def post(self, url, **kwargs):
+            self.called = True
+            self.url = url
+            self.payload = kwargs.get("json")
+            return FakeResponse()
+
+    async def scenario():
+        client = JevClient(config)
+        session = FakeSession()
+        client._session = session  # type: ignore[assignment]  # noqa: SLF001
+        result = await client.decide(state={"a": 1}, questions=QUESTIONS)
+        return session, result
+
+    session, result = run(scenario())
+    assert session.called, "_post 没有真的发请求（可能提前 return 了）"
+    assert session.url == "https://api.commandcode.ai/provider/v1/systemone"
+    assert session.payload["model"] == "typesafe/jev"
+    assert result["should_reply"].value == 0.6
+
+
+def test_post_works_for_every_channel() -> None:
+    """四个渠道都必须真的发出请求 —— 防止某个分支被误改坏。"""
+    configs = {
+        "official": {"channel": "official", "api_key": "k", "model": "jev-latest"},
+        "cloudflare": {
+            "channel": "cloudflare",
+            "cf_account_id": "acc",
+            "cf_api_token": "tok",
+            "cf_model": "typesafe/jev",
+        },
+        "opencode": {"channel": "opencode", "oc_api_key": "k", "oc_model": "jev-1.13-free"},
+        "commandcode": {"channel": "commandcode", "cc_api_key": "k", "cc_model": "typesafe/jev"},
+    }
+
+    class FakeResponse:
+        status = 200
+
+        async def json(self, **_kw):
+            return {
+                "result": {"answers": {"should_reply": {"type": "noul", "noul": 0.5}}},
+                "success": True,
+                "answers": {"should_reply": {"type": "noul", "noul": 0.5}},
+            }
+
+        async def text(self):
+            return ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        closed = False
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def post(self, url, **kwargs):
+            self.called = True
+            return FakeResponse()
+
+    async def scenario(raw):
+        client = JevClient(JevConfig.from_config(raw))
+        session = FakeSession()
+        client._session = session  # type: ignore[assignment]  # noqa: SLF001
+        await client.decide(state={"a": 1}, questions=QUESTIONS)
+        return session.called
+
+    for name, raw in configs.items():
+        assert run(scenario(raw)) is True, f"{name} 渠道没有真的发请求"
+
+
 def test_question_payload_omits_absent_criteria() -> None:
     payload = NoulQuestion(instructions="x").to_payload()
     assert "criteria" not in payload

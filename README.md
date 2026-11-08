@@ -302,7 +302,7 @@ Jev **没有 prompt / system 字段** —— 它只接受三样东西：
 拆开而不是问一个"该不该回复"，是因为后者把三个判断藏在一个数字背后 ——
 既没法单独调阈值，也看不出是哪一步否掉的。
 
-### 三个渠道
+### 四个渠道
 
 | | TypeSafe 官方 | Cloudflare Workers AI | OpenCode |
 |---|---|---|---|
@@ -310,6 +310,22 @@ Jev **没有 prompt / system 字段** —— 它只接受三样东西：
 | 请求形状 | `{model, state, questions}` | `{model, input:{state, questions}}` | `{model, state, questions}` |
 | 需要 | API Key | 账号 ID + Token | Console key（`oc_sk_` 开头） |
 | 免费可用 | ❌（但很便宜） | ❌ 免费额度不覆盖第三方模型 | ✅ **`jev-1.13-free` 免费** |
+
+#### Command Code（GOAT 计划）
+
+Provider API 的 `/provider/v1/systemone` 与 TypeSafe 官方**完全同构** ——
+同样的 `{model, state, questions}` → `{answers}`，只是换了域名和鉴权。
+所以这个渠道不需要任何请求体转换。
+
+| 项 | 值 |
+|---|---|
+| 端点 | `https://api.commandcode.ai/provider/v1/systemone` |
+| 模型 | `typesafe/jev`（或固定版本 `typesafe/jev-1.14.0`）|
+| 鉴权 | Command Code Studio 创建的 API key（`user_` 开头）|
+| 需要 | **GOAT 或更高计划**（$10/mo）|
+
+> ⚠️ **Go 计划（$1/mo）没有 API 权限**，调用会返回
+> `403 upgrade_required`。只有 GOAT / Pro / Max / Team / Provider 能调。
 
 #### OpenCode 免费 jev —— 可以用，但必须带齐三个东西
 

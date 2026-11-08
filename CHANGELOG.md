@@ -15,6 +15,40 @@
 
 ---
 
+## [1.7.0] - 2026-11-08
+
+### 新增
+
+- **Command Code 渠道（GOAT 计划）**。
+
+  Command Code 的 Provider API 提供 `/provider/v1/systemone`，与 TypeSafe
+  官方的 System One **完全同构**（同样的 `{model, state, questions}` →
+  `{answers}`），只是换了域名和鉴权 —— 所以请求体不需要任何转换，
+  只多一个 transport。
+
+  | 项 | 值 |
+  |---|---|
+  | 端点 | `https://api.commandcode.ai/provider/v1/systemone` |
+  | 模型 | `typesafe/jev`（或 `typesafe/jev-1.14.0` 固定版本）|
+  | 鉴权 | Studio 创建的 key（`user_` 开头）|
+  | 需要 | **GOAT 或更高**（$10/mo 起）|
+
+  错误提示针对该渠道专门处理：`403 upgrade_required` 会明确告知
+  「Go 计划没有 API 权限，需 GOAT 及以上」。
+
+### 修复
+
+- **`_post` 被误改，导致整个渠道静默失效**（开发过程中自己引入的）。
+
+  手工改代码时把 `_build_payload` 的分支误插进了 `_post`，
+  使它在发请求前直接 `return` 了一个 dict。**所有单元测试依然全绿**，
+  因为它们都 monkeypatch 了 `_post`。
+
+  新增两个测试盯住这条路径：`_post` 必须真的走到 `session.post`，
+  且四个渠道都要验证一遍。还专门注入同样的 bug 确认测试能抓住它。
+
+---
+
 ## [1.6.0] - 2026-11-08
 
 ### 修复

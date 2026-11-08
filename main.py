@@ -108,6 +108,8 @@ __all__ = ["BetterChatPlugin"]
 EXTRA_TICKET = "betterchat_ticket"
 EXTRA_STALE = "betterchat_stale"
 EXTRA_GROUP_VERDICT = "betterchat_group_verdict"
+EXTRA_REPLIED = "betterchat_replied"
+"""这一轮的回复已经放行发送了 —— 不该再被当成"可打断的目标"。"""
 
 #: 合并窗口里要跳过的消息类型 —— 只合并纯文本。
 _PLAIN_ONLY = "Plain"
@@ -486,6 +488,10 @@ class BetterChatPlugin(Star):
             LLM）；``False`` 表示本事件已被更新的一条接管，应静默退出。
         """
         reservation = self.merge.reserve(umo, text)
+        logger.debug(
+            f"[BetterChat] 登记 ticket={reservation.ticket} text={text[:30]!r} "
+            f"quiet={self.merge.settings.base_quiet_seconds}s"
+        )
 
         # 判断上一轮处于哪个阶段，这决定了本次该做什么：
         #
@@ -533,6 +539,7 @@ class BetterChatPlugin(Star):
             is_current=lambda: not event.is_stopped(),
         )
 
+        logger.debug(f"[BetterChat] ticket={reservation.ticket} 等待结果={outcome.value}")
         if outcome is not ReservationState.OWNER:
             # 被更新的一条接管，或插件被卸载 —— 本事件静默退出。
             # 这里没有 yield 任何结果，``_has_send_oper`` 仍是 False，
@@ -584,6 +591,9 @@ class BetterChatPlugin(Star):
         umo = event.unified_msg_origin
         if self.state.in_flight.get(umo) is event:
             self.state.in_flight.pop(umo, None)
+        # 走到这里说明这一轮的产出即将发送（或被本插件清空）。
+        # 无论哪种，它都已经结束，不该再被新的消息当作"可打断目标"。
+        event.set_extra(EXTRA_REPLIED, True)
 
         if not event.get_extra(EXTRA_STALE, False):
             return
@@ -633,6 +643,16 @@ class BetterChatPlugin(Star):
         if previous is None or previous is event:
             return
         if not self._is_generating(previous):
+            return
+        # 上一轮的回复**已经发出去了** → 不要再打断。
+        #
+        # 实测踩过：10:13:56.000 发出回复，10:13:56.354 又有新消息到达，
+        # 我们把已经结束的那一轮当成"还在生成"去打断，结果：
+        #   - 白白中断了正在跑的下一轮
+        #   - 用户看到回复发出后 Bot 又莫名其妙重来一次
+        # 用 replied 标记判断更可靠：on_decorating_result 一旦放行过内容，
+        # 这一轮就结束了，不该再被当作可打断的目标。
+        if previous.get_extra(EXTRA_REPLIED, False):
             return
         # 这一轮在被 follow_up 接管之前先停掉它。
         self._interrupt_in_flight(umo, event, previous=previous)

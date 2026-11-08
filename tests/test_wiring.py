@@ -1544,6 +1544,76 @@ def test_window_messages_still_merge_without_interrupt(loaded) -> None:
     assert not any(e.get_extra("betterchat_stale") for e in events)
 
 
+def test_does_not_interrupt_already_replied_turn(loaded) -> None:
+    """回归测试：已经发出回复的那一轮，不该再被打断。
+
+    实测踩过：10:13:56.000 发出回复，10:13:56.354 新消息到达，
+    我们把已经结束的那一轮当成「还在生成」去打断 —— 用户会看到
+    回复发出后 Bot 又莫名其妙重来一次，还白白中断了下一轮。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.02,
+            "min_quiet_seconds": 0.02,
+            "max_quiet_seconds": 0.02,
+            "total_seconds": 0.1,
+        }
+        config["interrupt"] = {"enable": True, "mode": "graceful"}
+        plugin = _isolated_plugin(loaded, config)
+
+        # 第一条：走完窗口，拿到本轮
+        first = FakeEvent("摩西摩西")
+        await plugin.on_waiting_llm(first)
+        assert first.get_extra("betterchat_ticket") is not None
+
+        # 模拟「回复已发出」：on_decorating_result 被调用
+        first._result = types.SimpleNamespace(chain=[_Plain("摩西摩西")])  # noqa: SLF001
+        await plugin.on_decorating_result(first)
+        assert first.get_extra("betterchat_replied") is True
+
+        # 新消息到达 → 不该打断已回复的那一轮
+        second = FakeEvent("在吗")
+        await plugin.on_preempt_private(second)
+        assert first.get_extra("betterchat_stale") is None, (
+            "已发出回复的轮次不该被打断"
+        )
+        return first, second
+
+    first, _second = run(scenario())
+    assert first.get_extra("betterchat_stale") is None
+
+
+def test_still_interrupts_generating_turn(loaded) -> None:
+    """没有发过回复的轮次，仍然可以被新消息打断（核心功能）。"""
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.02,
+            "min_quiet_seconds": 0.02,
+            "max_quiet_seconds": 0.02,
+            "total_seconds": 0.1,
+        }
+        config["interrupt"] = {"enable": True, "mode": "graceful"}
+        plugin = _isolated_plugin(loaded, config)
+
+        first = FakeEvent("摩西摩西")
+        await plugin.on_waiting_llm(first)
+        assert first.get_extra("betterchat_ticket") is not None
+        # 没有调用 on_decorating_result → 仍在"生成中"
+
+        second = FakeEvent("在吗")
+        await plugin.on_preempt_private(second)
+        return first
+
+    first = run(scenario())
+    assert first.get_extra("betterchat_stale") is True
+
+
 # --------------------------------------------------------------------------- #
 # 生命周期
 # --------------------------------------------------------------------------- #

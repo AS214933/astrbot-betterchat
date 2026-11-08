@@ -1614,6 +1614,76 @@ def test_still_interrupts_generating_turn(loaded) -> None:
     assert first.get_extra("betterchat_stale") is True
 
 
+def test_sticker_survives_merge(loaded) -> None:
+    """回归测试：贴纸/图片不能因为合并而丢失。
+
+    用户发「摩西摩西」再跟一个 🥰 贴纸，**正常人是一起看的**。
+    早期版本只取 message_str（贴纸的文本部分是空的），
+    合并结果里贴纸彻底消失，Bot 完全感受不到语气。
+    """
+
+    async def scenario():
+        config = FakeConfig(base_config())
+        config["private"] = {
+            "enable": True,
+            "base_quiet_seconds": 0.08,
+            "min_quiet_seconds": 0.08,
+            "max_quiet_seconds": 0.08,
+            "total_seconds": 0.4,
+        }
+        plugin = _isolated_plugin(loaded, config)
+
+        # 第一条：文字
+        text_event = FakeEvent("摩西摩西")
+        t1 = asyncio.create_task(plugin.on_waiting_llm(text_event))
+        await asyncio.sleep(0.01)
+
+        # 第二条：贴纸（无文本，只有 Image 组件）
+        sticker = FakeEvent("")
+        sticker.message_obj.message = [_Image("sticker.png")]
+        t2 = asyncio.create_task(plugin.on_waiting_llm(sticker))
+
+        await asyncio.gather(t1, t2, return_exceptions=True)
+        return text_event, sticker
+
+    text_event, sticker = run(scenario())
+
+    # 找出拿到本轮的那条
+    winners = [e for e in (text_event, sticker) if e.call_llm is False]
+    assert len(winners) == 1
+    merged_event = winners[0]
+
+    chain = merged_event.message_obj.message
+    kinds = [
+        str(getattr(getattr(c, "type", None), "value", getattr(c, "type", "")))
+        for c in chain
+    ]
+    # 文字和贴纸都要在
+    assert "Plain" in kinds, f"合并后丢失了文字: {kinds}"
+    assert "Image" in kinds, f"合并后丢失了贴纸: {kinds}"
+    # 文本内容也对
+    assert "摩西摩西" in merged_event.message_str
+
+
+def test_text_and_attachments_split(loaded) -> None:
+    """_text_and_attachments 正确拆分文本与非文本组件。"""
+    plugin_cls = loaded.module.BetterChatPlugin
+
+    event = FakeEvent("你好啊")
+    event.message_obj.message = [_Plain("你好啊"), _Image("a.png")]
+    text, attachments = plugin_cls._text_and_attachments(event)
+    assert text == "你好啊"
+    assert len(attachments) == 1
+    assert str(getattr(attachments[0].type, "value", "")) == "Image"
+
+    # 只有贴纸时：文本为空，附件有 1 个
+    pure = FakeEvent("")
+    pure.message_obj.message = [_Image("b.png")]
+    text2, att2 = plugin_cls._text_and_attachments(pure)
+    assert text2 == ""
+    assert len(att2) == 1
+
+
 # --------------------------------------------------------------------------- #
 # 生命周期
 # --------------------------------------------------------------------------- #

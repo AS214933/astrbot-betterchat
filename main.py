@@ -275,11 +275,20 @@ class BetterChatPlugin(Star):
         return True
 
     @staticmethod
-    def _replace_text(event: AstrMessageEvent, text: str) -> None:
-        """把合并后的文本就地写回事件。
+    def _replace_text(
+        event: AstrMessageEvent,
+        text: str,
+        attachments: list[object] | None = None,
+    ) -> None:
+        """把合并后的内容就地写回事件。
 
         刻意**不**重建合成事件：保留最新这条消息原生的 ``message_id``、
         权限与引用关系，才不会破坏回复引用和平台侧行为。
+
+        关键：``attachments``（图片 / 贴纸 / 文件…）必须一起放进消息链。
+        用户发一句话再配个表情，正常人是一起看的 —— 只把文字交给模型、
+        把表情丢掉，Bot 就完全感受不到语气。早期版本直接用
+        ``[Plain(text)]`` 整个替换，把贴纸全丢了。
         """
         event.message_str = text
         message_obj = getattr(event, "message_obj", None)
@@ -288,7 +297,15 @@ class BetterChatPlugin(Star):
         try:
             import astrbot.api.message_components as Comp
 
-            message_obj.message = [Comp.Plain(text)]
+            chain: list = []
+            if text:
+                chain.append(Comp.Plain(text))
+            for comp in attachments or ():
+                # 参数名是 text，但非文本组件本身已经有内容，直接放回去。
+                if comp is not None:
+                    chain.append(comp)
+            if chain:
+                message_obj.message = chain
         except Exception:  # noqa: BLE001 - 极端情况下退化为只改 message_str
             logger.debug("[BetterChat] 无法重建消息链，仅改写 message_str", exc_info=True)
         message_obj.message_str = text
@@ -487,7 +504,9 @@ class BetterChatPlugin(Star):
             ``True`` 表示本事件拿到了这一轮（合并文本已写回，应交给原生
             LLM）；``False`` 表示本事件已被更新的一条接管，应静默退出。
         """
-        reservation = self.merge.reserve(umo, text)
+        reservation = self.merge.reserve(
+            umo, text, attachments=self._text_and_attachments(event)[1]
+        )
         logger.debug(
             f"[BetterChat] 登记 ticket={reservation.ticket} text={text[:30]!r} "
             f"quiet={self.merge.settings.base_quiet_seconds}s"
@@ -553,17 +572,20 @@ class BetterChatPlugin(Star):
             self._take_over_turn(event)
             return False
 
-        merged, count = settled
-        if count > 1 or merged != text:
+        merged, count, attachments = settled
+        logger.debug(
+            f"[BetterChat] 结算 ticket={reservation.ticket} "
+            f"条数={count} 附件={len(attachments)}"
+        )
+        if count > 1 or merged != text or attachments:
             # 合并结果为空而本事件是图片/表情时，**不要**用空串覆盖它 ——
             # 那样会把消息内容清掉。让原生流程照常处理这条非文本消息，
             # 前面攒的文字已经作为会话历史进入了上下文。
-            if merged:
-                self._replace_text(event, merged)
-                logger.info(f"[BetterChat] 合并 {count} 条消息（{len(merged)} 字符）")
-            elif not text:
-                logger.debug(
-                    "[BetterChat] 本轮只有非文本消息，保留原消息内容"
+            if merged or attachments:
+                self._replace_text(event, merged, attachments)
+                logger.info(
+                    f"[BetterChat] 合并 {count} 条消息"
+                    f"（{len(merged)} 字符 + {len(attachments)} 个附件）"
                 )
         event.set_extra(EXTRA_TICKET, reservation.ticket)
         # 合并完成，交还给 AstrBot 的原生流程（人设/记忆/工具全部保留）。
@@ -1162,6 +1184,43 @@ class BetterChatPlugin(Star):
         import time
 
         return time.monotonic()
+
+    @staticmethod
+    def _text_and_attachments(event: AstrMessageEvent) -> tuple[str, list]:
+        """把一条消息拆成「文本」和「非文本组件」两部分。
+
+        为什么需要拆：合并窗口按文本拼接，但图片 / 贴纸 / 文件**不能丢** ——
+        用户发「摩西摩西」再跟一个 🥰 贴纸，正常人是一起看的。早期版本
+        只取 ``message_str``，贴纸（文本部分为空）被整个丢掉，
+        Bot 永远不知道用户发了表情。
+
+        Returns:
+            ``(文本, 非文本组件列表)``。
+        """
+        text = (event.message_str or "").strip()
+        chain = getattr(getattr(event, "message_obj", None), "message", None)
+        if not isinstance(chain, list):
+            return text, []
+
+        attachments: list = []
+        texts: list[str] = []
+        for comp in chain:
+            kind = str(getattr(getattr(comp, "type", None), "value", getattr(comp, "type", "")))
+            if kind == _PLAIN_ONLY:
+                piece = (getattr(comp, "text", "") or "").strip()
+                if piece:
+                    texts.append(piece)
+            elif kind == "Reply":
+                # 引用不进消息链（会破坏回复关系），但引用的文字是有用上下文。
+                quoted = (getattr(comp, "message_str", "") or "").strip()
+                if quoted and not text:
+                    texts.append(quoted)
+            else:
+                attachments.append(comp)
+
+        # message_str 优先（平台已经处理过的纯文本），否则用链里的 Plain。
+        effective = text or " ".join(texts).strip()
+        return effective, attachments
 
     @staticmethod
     def _message_chain(event: AstrMessageEvent) -> list:

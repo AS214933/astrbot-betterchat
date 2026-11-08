@@ -203,6 +203,12 @@ class _PendingTurn:
     owner_ticket: int = 0
     latest_at: float = 0.0
     parts: list[str] = field(default_factory=list)
+    attachments: list[object] = field(default_factory=list)
+    """这一轮里出现过的非文本组件（图片 / 贴纸 / 文件…）。
+
+    必须保留：用户发一句文字再配个表情，正常人是一起看的。
+    只把文字交给模型、把表情丢掉，等于让 Bot 看不懂情绪。
+    """
     count: int = 0
     version: int = 0
     """每次有更新消息进来 +1；等待者靠它判断是否被超越。"""
@@ -264,7 +270,9 @@ class MergeWindow:
 
     # -- 登记 ------------------------------------------------------------- #
 
-    def reserve(self, session_key: str, text: str) -> Reservation:
+    def reserve(
+        self, session_key: str, text: str, attachments: Sequence[object] | None = None
+    ) -> Reservation:
         """同步登记一条消息，返回它在本轮中的位置。
 
         关键：**这个函数内部不能有 ``await``**。AstrBot 的事件循环里
@@ -283,6 +291,9 @@ class MergeWindow:
         turn.owner_ticket = reservation.ticket
         turn.latest_at = now
         turn.parts.append(text)
+        for comp in attachments or ():
+            if comp is not None:
+                turn.attachments.append(comp)
         turn.count += 1
         turn.version += 1
         # 唤醒可能在等的旧等待者，让它们重新判断归属。
@@ -393,7 +404,7 @@ class MergeWindow:
 
     async def settle(
         self, session_key: str, reservation: Reservation
-    ) -> tuple[str, int] | None:
+    ) -> tuple[str, int, list[object]] | None:
         """原子地关闭本轮并取走合并文本。
 
         Returns:
@@ -406,7 +417,7 @@ class MergeWindow:
             self._turns.pop(session_key, None)
             self._settled[session_key] = reservation.ticket
             merged = merge_texts(turn.parts, max_chars=self.settings.max_chars)
-            return merged, turn.count
+            return merged, turn.count, list(turn.attachments)
 
 
 class GroupAggregator:

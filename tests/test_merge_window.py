@@ -115,7 +115,7 @@ def test_single_message_becomes_owner_after_quiet_window() -> None:
         assert state is ReservationState.OWNER
         return await window.settle("s1", reservation)
 
-    assert run(scenario()) == ("你好", 1)
+    assert run(scenario()) == ("你好", 1, [])
 
 
 def test_newer_message_supersedes_older_waiter() -> None:
@@ -136,7 +136,7 @@ def test_newer_message_supersedes_older_waiter() -> None:
         assert await window.wait_for_quiet("s", second) is ReservationState.OWNER
         return await window.settle("s", second)
 
-    assert run(scenario()) == ("第一句\n第二句", 2)
+    assert run(scenario()) == ("第一句\n第二句", 2, [])
 
 
 def test_settle_after_close_returns_none() -> None:

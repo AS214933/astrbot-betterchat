@@ -1069,6 +1069,122 @@ def test_opencode_decision_models_all_send_requests() -> None:
     assert len(seen) == len(OPENCODE_DECISION_MODELS)
 
 
+def test_opencode_go_uses_different_base_url() -> None:
+    """OpenCode 的 Console 和 Go 是**两套 base URL**，选错会 401。
+
+    官方文档的 Base URLs 表：
+
+    | 计划 | Base URL |
+    |---|---|
+    | Pay-as-you-go | `https://opencode.ai/inference` |
+    | Go | `https://opencode.ai/inference/go` |
+
+    实测（无 key 探测）也印证了：
+
+    * `/inference/systemone/...`   → `400 Model is unavailable`
+    * `/inference/go/systemone/...` → `401 OpenCode Go requires an API key`
+
+    后者错误信息直接点名 "OpenCode Go"，说明是独立入口。
+    """
+    console = JevConfig.from_config(
+        {"channel": "opencode", "oc_api_key": "k", "oc_plan": "console"}
+    )
+    go = JevConfig.from_config(
+        {"channel": "opencode", "oc_api_key": "k", "oc_plan": "go"}
+    )
+
+    assert console.endpoint() == (
+        "https://opencode.ai/inference/systemone/v1/systemone"
+    )
+    assert go.endpoint() == (
+        "https://opencode.ai/inference/go/systemone/v1/systemone"
+    )
+    # 必须真的不同 —— 这是这次适配的核心
+    assert console.endpoint() != go.endpoint()
+
+
+def test_opencode_plan_defaults_to_console() -> None:
+    """不填 oc_plan 时走 console，保持旧配置兼容。"""
+    config = JevConfig.from_config({"channel": "opencode", "oc_api_key": "k"})
+    assert config.oc_plan == "console"
+    assert "/go/" not in config.endpoint()
+
+
+def test_opencode_manual_base_overrides_plan() -> None:
+    """手动填了地址就以手动为准（便于指向代理或私有部署）。"""
+    config = JevConfig.from_config(
+        {
+            "channel": "opencode",
+            "oc_api_key": "k",
+            "oc_plan": "go",
+            "oc_api_base": "https://proxy.example.com/x",
+        }
+    )
+    assert config.endpoint() == "https://proxy.example.com/x/systemone"
+
+
+def test_opencode_go_decision_models_work() -> None:
+    """Go 计划下的三个决策模型也共用同一套请求体。"""
+
+    class FakeResponse:
+        status = 200
+
+        async def json(self, **_kw):
+            return {"answers": {"should_reply": {"type": "noul", "noul": 0.5}}}
+
+        async def text(self):
+            return ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        closed = False
+
+        def __init__(self) -> None:
+            self.url = None
+            self.payload = None
+
+        def post(self, url, **kwargs):
+            self.url = url
+            self.payload = kwargs.get("json")
+            return FakeResponse()
+
+    async def scenario(model):
+        client = JevClient(
+            JevConfig.from_config(
+                {
+                    "channel": "opencode",
+                    "oc_api_key": "k",
+                    "oc_plan": "go",
+                    "oc_model": model,
+                }
+            )
+        )
+        session = FakeSession()
+        client._session = session  # type: ignore[assignment]  # noqa: SLF001
+        await client.decide(state={"a": 1}, questions=QUESTIONS)
+        return session
+
+    from betterchat_jev import OPENCODE_DECISION_MODELS
+
+    for model in OPENCODE_DECISION_MODELS:
+        session = run(scenario(model))
+        assert "/inference/go/" in session.url, f"{model} 用错了 base"
+        assert session.payload["model"] == model
+
+
+def test_opencode_go_requires_key_with_plan_hint() -> None:
+    """没 key 时的提示要提到 Go 计划。"""
+    config = JevConfig.from_config({"channel": "opencode", "oc_plan": "go"})
+    message = config.ready_missing()
+    assert message is not None
+    assert "oc_api_key" in message
+
+
 def test_question_payload_omits_absent_criteria() -> None:
     payload = NoulQuestion(instructions="x").to_payload()
     assert "criteria" not in payload

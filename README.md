@@ -327,6 +327,32 @@ Provider API 的 `/provider/v1/systemone` 与 TypeSafe 官方**完全同构** �
 > ⚠️ **Go 计划（$1/mo）没有 API 权限**，调用会返回
 > `403 upgrade_required`。只有 GOAT / Pro / Max / Team / Provider 能调。
 
+#### OpenCode 的两个计划要用不同的 Base URL ⚠️
+
+官方文档的 Base URLs 表：
+
+| 计划 | Base URL | 面板选项 |
+|---|---|---|
+| 按量付费（Console / Zen） | `https://opencode.ai/inference` | `console` |
+| **Go 订阅** | `https://opencode.ai/inference/go` | `go` |
+
+**选错会 401**。实测（无 key 探测）：
+
+```
+POST /inference/systemone/v1/systemone
+  → 400 {"error":{"type":"server_error","message":"Upstream request failed: Model is unavailable."}}
+
+POST /inference/go/systemone/v1/systemone
+  → 401 {"error":{"type":"authentication_error","message":"OpenCode Go requires an API key"}}
+```
+
+后者直接点名 "OpenCode Go"，说明是独立入口。
+
+面板里把「OpenCode 套餐」选成对应值即可，插件会自动拼 base URL。
+如果你手动填了「API 地址」，则以手填为准（便于指向代理）。
+
+---
+
 #### OpenCode 的决策模型（Go 计划）
 
 OpenCode Go 除了 Jev，还提供两个**通用决策模型**。三者共用同一个 endpoint、

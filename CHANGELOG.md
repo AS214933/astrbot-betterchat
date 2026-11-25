@@ -15,6 +15,44 @@
 
 ---
 
+## [1.8.1] - 2026-11-25
+
+### 修复
+
+- **OpenCode 适配了 Go 订阅，之前只支持按量付费**。
+
+  OpenCode 的**两个计划走不同的 base URL**（官方文档 Base URLs 表）：
+
+  | 计划 | Base URL |
+  |---|---|
+  | 按量付费（Console / Zen） | `https://opencode.ai/inference` |
+  | **Go 订阅** | `https://opencode.ai/inference/go` |
+
+  之前插件把 base 写死成 Console 的路径，**Go 用户填了 key 也调不通**。
+
+  实测（无 key 探测，只看错误类型）印证这是两个独立入口：
+
+  ```
+  POST /inference/systemone/v1/systemone
+    → 400 "Upstream request failed: Model is unavailable."
+  POST /inference/go/systemone/v1/systemone
+    → 401 "OpenCode Go requires an API key"
+  ```
+
+  后者直接点名 "OpenCode Go"。
+
+  新增面板选项 `jev.oc_plan`（`console` / `go`），选好后 base URL
+  自动跟随；手动填了 `oc_api_base` 则以手填为准（便于指向代理）。
+
+  不填 `oc_plan` 时默认 `console`，旧配置无需改动。
+
+### 说明
+
+- 三个决策模型（Jev / Gemini Decision 1 / GPT 6 Luna Decision）在
+  两个计划下都能用，请求体完全相同。
+
+---
+
 ## [1.8.0] - 2026-11-25
 
 ### 新增

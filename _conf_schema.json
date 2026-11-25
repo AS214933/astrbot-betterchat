@@ -329,6 +329,24 @@
         "default": "",
         "secret": true
       },
+      "oc_plan": {
+        "type": "string",
+        "description": "OpenCode 套餐",
+        "options": [
+          "console",
+          "go"
+        ],
+        "labels": [
+          "按量付费（Console / Zen）",
+          "Go 订阅"
+        ],
+        "subtitles": [
+          "base: opencode.ai/inference —— 用多少付多少",
+          "base: opencode.ai/inference/go —— 每月包含额度"
+        ],
+        "default": "console",
+        "hint": "两个计划的 base URL **不同**，选错了会 401。Go 订阅用户必须选 go；按量付费选 console。如果你手动填了「API 地址」，这里的选择会被忽略。"
+      },
       "oc_api_base": {
         "type": "string",
         "description": "OpenCode API 地址",

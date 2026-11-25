@@ -60,7 +60,24 @@ DEFAULT_CF_BASE = "https://api.cloudflare.com/client/v4/accounts"
 #: * 付费 ``jev-1.13`` 需要账户有余额，否则 ``402 Insufficient account funds``。
 #: * ``OpenCode Go`` 订阅里**没有 Jev**（78 个模型无一含 jev；打 Go 路由返回
 #:   ``Model is unavailable``），所以不为 Go 单独做渠道。
+#: OpenCode 的 System One 端点。**两个计划的 base URL 不同**（官方文档）：
+#:
+#: | 计划 | Base URL |
+#: |---|---|
+#: | Pay-as-you-go（Console / Zen） | ``https://opencode.ai/inference`` |
+#: | **Go**（订阅） | ``https://opencode.ai/inference/go`` |
+#:
+#: 实测（无 key 探测）也印证了这一点：
+#:
+#: * ``/inference/systemone/...`` → ``400 Model is unavailable``
+#: * ``/inference/go/systemone/...`` → ``401 OpenCode Go requires an API key``
+#:
+#: 后者的错误信息直接点名 "OpenCode Go"，说明是独立入口。
+#: 老路径 ``/zen/go/v1`` 仍在代理，但官方文档已改成 ``/inference/go``。
 DEFAULT_OC_BASE = "https://opencode.ai/inference/systemone/v1"
+
+#: Go 计划对应的完整 System One 端点。
+DEFAULT_OC_GO_BASE = "https://opencode.ai/inference/go/systemone/v1"
 #: Command Code 的 Provider API。它的 ``/provider/v1/systemone`` 与 TypeSafe
 #: 官方**完全同构**（同样的 ``{model, state, questions}`` → ``{answers}``），
 #: 只是换了域名和鉴权，所以请求体不需要任何转换。
@@ -131,6 +148,13 @@ class JevConfig:
     cf_model: str = DEFAULT_CF_MODEL
     oc_api_key: str = ""
     oc_api_base: str = DEFAULT_OC_BASE
+    oc_plan: str = "console"
+    """OpenCode 的套餐类型：``console``（按量付费）或 ``go``（订阅）。
+
+    两者的 base URL 不同，必须区分：
+    * ``console`` → ``https://opencode.ai/inference``
+    * ``go``      → ``https://opencode.ai/inference/go``
+    """
     oc_model: str = DEFAULT_OC_MODEL
     cc_api_key: str = ""
     cc_api_base: str = DEFAULT_CC_BASE
@@ -183,7 +207,17 @@ class JevConfig:
             cf_api_token=text("cf_api_token", ""),
             cf_model=cf_model,
             oc_api_key=text("oc_api_key", ""),
-            oc_api_base=text("oc_api_base", DEFAULT_OC_BASE) or DEFAULT_OC_BASE,
+            oc_api_base=(
+                text("oc_api_base", "").strip()
+                or (
+                    DEFAULT_OC_GO_BASE
+                    if text("oc_plan", "console").lower() == "go"
+                    else DEFAULT_OC_BASE
+                )
+            ),
+            oc_plan=(
+                "go" if text("oc_plan", "console").lower() == "go" else "console"
+            ),
             oc_model=text("oc_model", DEFAULT_OC_MODEL) or DEFAULT_OC_MODEL,
             cc_api_key=text("cc_api_key", ""),
             cc_api_base=text("cc_api_base", DEFAULT_CC_BASE) or DEFAULT_CC_BASE,

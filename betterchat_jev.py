@@ -68,6 +68,35 @@ DEFAULT_CC_BASE = "https://api.commandcode.ai/provider/v1"
 DEFAULT_CC_MODEL = "typesafe/jev"
 DEFAULT_OC_MODEL = "jev-1.13-free"
 
+#: OpenCode Go 提供的**决策模型**（System One / Decision 类）。
+#:
+#: 官方文档原话：``gpt-6-luna-decision`` 和 ``gemini-decision-1``
+#: 「接受与 Jev 相同的 System One 请求，在同一个 endpoint」。
+#: 也就是说请求体完全一样，只有 ``model`` 的值不同 —— 不需要任何转换。
+#:
+#: 三个模型的差异（用于面板提示，不影响我们发请求）：
+#:
+#: * ``jev-1.13-free`` —— 限时免费，有未公开用量上限
+#: * ``jev-1.14`` —— 付费，$0.042/1M tokens，92ms（三者最快）
+#: * ``gemini-decision-1`` —— $0.10/1M，211ms，支持音频/视频/PDF
+#:   （26 万上下文，单次最多 1000 个问题）
+#: * ``gpt-6-luna-decision`` —— $0.10/1M，206ms，只支持文本和图片
+#:   （单次最多 400 个问题，有 prompt 缓存降价）
+OPENCODE_DECISION_MODELS: tuple[str, ...] = (
+    "jev-1.13-free",
+    "jev-1.13",
+    "jev-1.14",
+    "gemini-decision-1",
+    "gpt-6-luna-decision",
+)
+
+#: 这些模型**不需要** ``x-opencode-session`` 头。
+#:
+#: 文档明确：「a note that these requests don't need ``x-opencode-session``」。
+#: 但带上也无害（实测 Jev 必须带），所以统一带上更省心 —— 这里只作为
+#: 排查依据记录，不改变发送逻辑。
+OPENCODE_MODELS_WITHOUT_SESSION = ("gemini-decision-1", "gpt-6-luna-decision")
+
 #: 调用 OpenCode 时必须携带的 User-Agent。
 #: 用 ``Python/3.x aiohttp/...`` 这类默认值会被 Cloudflare 的浏览器完整性
 #: 校验拦成 ``403 error code: 1010``，看着像 key 无效，其实是 UA 被拒。
@@ -661,6 +690,17 @@ def _explain_http_error(*, status: int, body: str, channel: str) -> str:
             )
 
     if channel == "opencode":
+        # 决策模型专属的模型名错误：用户可能填了 OpenAI/Google 的原始模型名。
+        if "model" in body.lower() and status in (400, 404):
+            if "gpt-6-luna" in body or "gemini-decision" in body or "not found" in body.lower():
+                return (
+                    f"OpenCode 不认这个决策模型（HTTP {status}）。"
+                    "正确的模型 ID 是 `gemini-decision-1` 和 "
+                    "`gpt-6-luna-decision`（带 -decision 后缀），"
+                    "不是 `gpt-6-luna` 或 `gemini-decision`。"
+                    f"原始响应: {summary}"
+                )
+
         # 403 + error code 1010：Cloudflare 浏览器完整性校验拦截，通常是 UA 太少见。
         if "1010" in body:
             return (

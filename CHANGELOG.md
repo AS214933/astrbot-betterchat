@@ -15,6 +15,40 @@
 
 ---
 
+## [1.8.0] - 2026-11-25
+
+### 新增
+
+- **OpenCode 渠道支持三个决策模型**（不只是 Jev）。
+
+  OpenCode Go 现在提供三个 System One 决策模型。官方文档明确：
+  `gpt-6-luna-decision` 和 `gemini-decision-1`
+  「take the same System One request as Jev, on the same endpoint」——
+  请求体完全一样，只有 `model` 值不同。
+
+  所以这次**没有新增任何请求逻辑**，只是把 `oc_model` 从自由文本改成
+  带说明的下拉：
+
+  | 模型 | ID | 价格 | 速度 | 单次问题数 | 输入 |
+  |---|---|---|---|---|---|
+  | Jev 1.13 Free | `jev-1.13-free` | 免费 | 快 | — | 文本 |
+  | Jev 1.13 | `jev-1.13` | $0.042/1M | 快 | — | 文本 |
+  | Jev 1.14 | `jev-1.14` | $0.042/1M | **92ms** | — | 文本 + 图片 |
+  | Gemini Decision 1 | `gemini-decision-1` | $0.10/1M | 211ms | **1000** | 文本 + 图片 + **音频/视频/PDF** |
+  | GPT 6 Luna Decision | `gpt-6-luna-decision` | $0.10/1M | 206ms | 400 | 文本 + 图片 |
+
+  三者输出 token 都免费（只返回带概率的结构化答案）。
+
+  另加一条针对性的错误提示：填了 `gpt-6-luna` 或 `gemini-decision`
+  （少了 `-decision` 后缀或写错）时，会直接告诉你正确的 ID 是什么。
+
+### 说明
+
+- `gemini-decision-1` / `gpt-6-luna-decision` 官方说不需要
+  `x-opencode-session` 头；插件仍然统一带上（Jev 必需），不影响使用。
+
+---
+
 ## [1.7.2] - 2026-11-08
 
 ### 修复

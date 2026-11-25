@@ -485,11 +485,17 @@ class BetterChatPlugin(Star):
 
         if is_private:
             settings = self._merge_settings()
+            logger.debug(
+                f"[BetterChat] 入站 text={(event.message_str or '')[:40]!r} "
+                f"components={[str(getattr(getattr(c,'type',None),'value',getattr(c,'type','?'))) for c in (getattr(getattr(event,'message_obj',None),'message',None) or [])]}"
+            )
             if not settings.enable:
+                logger.debug("[BetterChat] 合并已关闭，放行")
                 self._register_in_flight(umo, event)
                 return
             text = (event.message_str or "").strip()
             if text and settings.should_ignore(text):
+                logger.debug(f"[BetterChat] 指令前缀跳过合并: {text[:20]!r}")
                 self._register_in_flight(umo, event)
                 return
             # 判断该「打断重来」还是「让 follow_up 并进当前回复」。
@@ -515,6 +521,7 @@ class BetterChatPlugin(Star):
             # 触发第二次 —— 一次行为产生两个回复，还互相排队拖慢。
             if not text and self._is_plain_text(event):
                 # 空消息（纯空白）没什么可合并的，交还原生流程。
+                logger.debug("[BetterChat] 空消息且纯文本，放行（不进窗口）")
                 self._register_in_flight(umo, event)
                 return
             owns_turn = await self._merge_turn(umo, event, text)

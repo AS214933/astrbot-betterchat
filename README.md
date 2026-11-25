@@ -327,6 +327,32 @@ Provider API 的 `/provider/v1/systemone` 与 TypeSafe 官方**完全同构** �
 > ⚠️ **Go 计划（$1/mo）没有 API 权限**，调用会返回
 > `403 upgrade_required`。只有 GOAT / Pro / Max / Team / Provider 能调。
 
+#### OpenCode 的决策模型（Go 计划）
+
+OpenCode Go 除了 Jev，还提供两个**通用决策模型**。三者共用同一个 endpoint、
+同样的请求体，只有 `model` 值不同 —— 在面板下拉里切换即可，不需要改任何配置。
+
+| 模型 | ID | 价格 | 速度 | 单次问题数 | 输入类型 |
+|---|---|---|---|---|---|
+| Jev 1.13 Free | `jev-1.13-free` | 免费 | 快 | — | 文本 |
+| Jev 1.14 | `jev-1.14` | $0.042/1M | **92ms**（最快） | — | 文本 + 图片 |
+| Gemini Decision 1 | `gemini-decision-1` | $0.10/1M | 211ms | **1000** | 文本 + 图片 + **音频/视频/PDF** |
+| GPT 6 Luna Decision | `gpt-6-luna-decision` | $0.10/1M | 206ms | 400 | 文本 + 图片 |
+
+> 输出 token 全部免费（决策模型只返回带概率的结构化答案，不生成文本）。
+
+**怎么选**：
+
+- 想省钱 → `jev-1.13-free`（有未公开用量上限）
+- 想要最快 → `jev-1.14`（92ms，比另两个快一倍多）
+- 要处理语音/视频/PDF → `gemini-decision-1`（唯一支持多模态的）
+- 需要大量并行问题 → `gemini-decision-1`（单次最多 1000 个）
+
+**注意**：`gemini-decision-1` 和 `gpt-6-luna-decision` 官方说不需要
+`x-opencode-session` 头，但插件统一带上（Jev 必需），不影响使用。
+
+---
+
 #### OpenCode 免费 jev —— 可以用，但必须带齐三个东西
 
 `jev-1.13-free` **是可以从插件调用的**（实测返回 200 且 `usage.cost == 0`），

@@ -338,8 +338,29 @@
       "oc_model": {
         "type": "string",
         "description": "OpenCode 模型",
-        "hint": "jev-1.13-free（限时免费，推荐）或 jev-1.13（需账户余额）。注意免费模型有未公开的用量上限，用尽后需等待重置。",
-        "default": "jev-1.13-free"
+        "options": [
+          "jev-1.13-free",
+          "jev-1.13",
+          "jev-1.14",
+          "gemini-decision-1",
+          "gpt-6-luna-decision"
+        ],
+        "labels": [
+          "Jev 1.13 Free（限时免费）",
+          "Jev 1.13（付费 $0.042）",
+          "Jev 1.14（付费 $0.042，最快 92ms）",
+          "Gemini Decision 1（$0.10，支持音视频/PDF）",
+          "GPT 6 Luna Decision（$0.10，支持图片）"
+        ],
+        "subtitles": [
+          "有未公开的用量上限，用尽需等待重置",
+          "92ms，性价比最高，推荐生产用",
+          "比 1.13 略强，价格相同，速度最快",
+          "单次最多 1000 问题，26 万上下文，可传音频/视频/PDF",
+          "单次最多 400 问题，只支持文本和图片，有缓存降价"
+        ],
+        "default": "jev-1.13-free",
+        "hint": "OpenCode Go 的三个决策模型（Jev / Gemini Decision / GPT Luna Decision）共用同一个 endpoint、同样的请求体，只有 model 值不同，所以在这里切换即可。Gemini Decision 1 和 GPT 6 Luna Decision 不需要 x-opencode-session 头，但插件统一带上（Jev 必须带），不影响使用。"
       },
       "cc_api_key": {
         "type": "string",

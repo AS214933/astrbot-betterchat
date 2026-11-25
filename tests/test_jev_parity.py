@@ -984,6 +984,91 @@ def test_post_works_for_every_channel() -> None:
         assert run(scenario(raw)) is True, f"{name} 渠道没有真的发请求"
 
 
+def test_opencode_decision_models_share_payload_shape() -> None:
+    """OpenCode Go 的决策模型共用同一个 endpoint 和请求体。
+
+    官方文档原话：``gpt-6-luna-decision`` 和 ``gemini-decision-1``
+    「take the same System One request as Jev, on the same endpoint」。
+
+    所以切换模型**不需要**任何请求体转换 —— 只有 ``model`` 的值不同。
+    这个用例盯住这一点，防止以后有人给某个模型加特判把它改坏。
+    """
+    from betterchat_jev import OPENCODE_DECISION_MODELS
+
+    shapes = {}
+    for model in OPENCODE_DECISION_MODELS:
+        config = JevConfig.from_config(
+            {"channel": "opencode", "oc_api_key": "k", "oc_model": model}
+        )
+        # 同一个 endpoint
+        assert config.endpoint() == "https://opencode.ai/inference/systemone/v1/systemone"
+        assert config.active_model() == model
+
+        client = JevClient(config)
+        payload = client._build_payload({"x": 1}, {"q": QUESTIONS["should_reply"]})
+        shapes[model] = (tuple(sorted(payload)), payload["model"])
+
+    # 所有模型的 key 集合完全一致
+    key_sets = {v[0] for v in shapes.values()}
+    assert len(key_sets) == 1, f"请求体形状不一致: {shapes}"
+    assert key_sets.pop() == ("model", "questions", "state")
+
+    # 每个模型都把自己写进 model 字段
+    for model, (_keys, got) in shapes.items():
+        assert got == model, f"{model} 的 model 字段被写成了 {got}"
+
+
+def test_opencode_decision_models_all_send_requests() -> None:
+    """三个决策模型都必须真的发出请求（不是只改了字段）。"""
+    seen = {}
+
+    class FakeResponse:
+        status = 200
+
+        async def json(self, **_kw):
+            return {"answers": {"should_reply": {"type": "noul", "noul": 0.5}}}
+
+        async def text(self):
+            return ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        closed = False
+
+        def __init__(self) -> None:
+            self.payload = None
+
+        def post(self, url, **kwargs):
+            self.payload = kwargs.get("json")
+            return FakeResponse()
+
+    async def scenario(model):
+        client = JevClient(
+            JevConfig.from_config(
+                {"channel": "opencode", "oc_api_key": "k", "oc_model": model}
+            )
+        )
+        session = FakeSession()
+        client._session = session  # type: ignore[assignment]  # noqa: SLF001
+        await client.decide(state={"a": 1}, questions=QUESTIONS)
+        return session.payload
+
+    from betterchat_jev import OPENCODE_DECISION_MODELS
+
+    for model in OPENCODE_DECISION_MODELS:
+        payload = run(scenario(model))
+        assert payload is not None, f"{model} 没有发请求"
+        assert payload["model"] == model
+        seen[model] = True
+
+    assert len(seen) == len(OPENCODE_DECISION_MODELS)
+
+
 def test_question_payload_omits_absent_criteria() -> None:
     payload = NoulQuestion(instructions="x").to_payload()
     assert "criteria" not in payload

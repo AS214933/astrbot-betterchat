@@ -1169,9 +1169,11 @@ def test_opencode_go_decision_models_work() -> None:
         await client.decide(state={"a": 1}, questions=QUESTIONS)
         return session
 
-    from betterchat_jev import OPENCODE_DECISION_MODELS
+    # Go 下只能用 Go 的模型表（jev-1.13-free 会被自动换成 jev-1.14，
+    # 那是刻意的行为，见 test_go_plan_replaces_incompatible_model）
+    from betterchat_jev import OPENCODE_GO_MODELS
 
-    for model in OPENCODE_DECISION_MODELS:
+    for model in OPENCODE_GO_MODELS:
         session = run(scenario(model))
         assert "/inference/go/" in session.url, f"{model} 用错了 base"
         assert session.payload["model"] == model
@@ -1183,6 +1185,120 @@ def test_opencode_go_requires_key_with_plan_hint() -> None:
     message = config.ready_missing()
     assert message is not None
     assert "oc_api_key" in message
+
+
+def test_saved_default_base_does_not_override_plan() -> None:
+    """回归测试：保存下来的「默认地址」不能覆盖套餐选择。
+
+    面板里「API 地址」有默认值，**一旦配置被保存，那个默认值就变成
+    用户配置里的实际值**。如果简单地「填了就用手填的」，套餐选择就
+    永远失效 —— 实测踩过：
+
+        用户选 oc_plan=go，但 oc_api_base 是保存下来的 Console 默认值
+        → 请求打到 Console
+        → 402 "This request is pay-as-you-go, billed to OpenCode Models credits.
+              OpenCode Go covers only requests to the OpenCode Go provider."
+
+    所以只有值**不在已知默认值集合里**，才认为用户真的手动改过。
+    """
+    # 各种「保存下来的默认值」都必须被忽略
+    for stale in (
+        "https://opencode.ai/inference/systemone/v1",
+        "https://opencode.ai/inference/systemone/v1/systemone",
+        "https://opencode.ai/inference",
+        "https://opencode.ai/inference/go/systemone/v1",
+        "https://opencode.ai/inference/go",
+    ):
+        config = JevConfig.from_config(
+            {
+                "channel": "opencode",
+                "oc_api_key": "k",
+                "oc_plan": "go",
+                "oc_api_base": stale,
+            }
+        )
+        assert "/inference/go/" in config.endpoint(), (
+            f"保存的默认值 {stale!r} 覆盖了 Go 套餐选择，"
+            f"实际 endpoint={config.endpoint()}"
+        )
+
+
+def test_custom_base_still_wins() -> None:
+    """真正自定义的地址（代理 / 私有部署）仍应生效。"""
+    config = JevConfig.from_config(
+        {
+            "channel": "opencode",
+            "oc_api_key": "k",
+            "oc_plan": "go",
+            "oc_api_base": "https://my-proxy.example.com/v1",
+        }
+    )
+    assert config.endpoint() == "https://my-proxy.example.com/v1/systemone"
+
+
+def test_go_plan_replaces_incompatible_model() -> None:
+    """Go 下 jev-1.13-free / jev-1.13 用不了，要自动换成 Go 可用的。
+
+    官方 Go 页面只列 jev-1.14 / gemini-decision-1 / gpt-6-luna-decision。
+    留着 free 模型会走到按量计费通道并报 402。
+    """
+    for incompatible in ("jev-1.13-free", "jev-1.13", "some-unknown-model"):
+        config = JevConfig.from_config(
+            {
+                "channel": "opencode",
+                "oc_api_key": "k",
+                "oc_plan": "go",
+                "oc_model": incompatible,
+            }
+        )
+        assert config.active_model() in ("jev-1.14", "gemini-decision-1", "gpt-6-luna-decision"), (
+            f"Go 下 {incompatible!r} 应当被换掉，实际 {config.active_model()!r}"
+        )
+
+
+def test_go_plan_keeps_compatible_model() -> None:
+    """Go 下合法的模型不能被改。"""
+    from betterchat_jev import OPENCODE_GO_MODELS
+
+    for model in OPENCODE_GO_MODELS:
+        config = JevConfig.from_config(
+            {
+                "channel": "opencode",
+                "oc_api_key": "k",
+                "oc_plan": "go",
+                "oc_model": model,
+            }
+        )
+        assert config.active_model() == model
+
+
+def test_console_plan_keeps_free_model() -> None:
+    """Console 下 jev-1.13-free 合法，不能被改。"""
+    config = JevConfig.from_config(
+        {
+            "channel": "opencode",
+            "oc_api_key": "k",
+            "oc_plan": "console",
+            "oc_model": "jev-1.13-free",
+        }
+    )
+    assert config.active_model() == "jev-1.13-free"
+
+
+def test_pay_as_you_go_402_has_plan_hint() -> None:
+    """Go 用户打到 Console 端点时的报错，要直接指出套餐选错了。"""
+    from betterchat_jev import _explain_http_error
+
+    body = (
+        '{"error":{"type":"invalid_request_error","message":"Insufficient balance. '
+        "This request is pay-as-you-go, billed to OpenCode Models credits. "
+        'OpenCode Go covers only requests to the OpenCode Go provider."}}'
+    )
+    message = _explain_http_error(status=402, body=body, channel="opencode")
+    assert "按量付费" in message
+    assert "Go 订阅" in message
+    # 不能只甩原始响应，要给出可操作的指引
+    assert "API 地址" in message
 
 
 def test_question_payload_omits_absent_criteria() -> None:

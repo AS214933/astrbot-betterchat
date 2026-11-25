@@ -58,8 +58,10 @@ DEFAULT_CF_BASE = "https://api.cloudflare.com/client/v4/accounts"
 #: 另外：
 #:
 #: * 付费 ``jev-1.13`` 需要账户有余额，否则 ``402 Insufficient account funds``。
-#: * ``OpenCode Go`` 订阅里**没有 Jev**（78 个模型无一含 jev；打 Go 路由返回
-#:   ``Model is unavailable``），所以不为 Go 单独做渠道。
+#: * **Go 订阅也有决策模型**（早期认为没有，是错的）：官方 Go 页面列了
+#:   ``jev-1.14`` / ``gemini-decision-1`` / ``gpt-6-luna-decision``。
+#:   但 Go **不含** ``jev-1.13-free`` 和 ``jev-1.13`` —— 它们在 Go 下会
+#:   被当成按量付费并报 402，所以选 Go 时要自动换成 Go 可用的模型。
 #: OpenCode 的 System One 端点。**两个计划的 base URL 不同**（官方文档）：
 #:
 #: | 计划 | Base URL |
@@ -107,6 +109,20 @@ OPENCODE_DECISION_MODELS: tuple[str, ...] = (
     "gpt-6-luna-decision",
 )
 
+#: **Go 订阅**下实际可用的决策模型。
+#:
+#: 官方 Go 页面只列了这三个 —— ``jev-1.13-free`` 和 ``jev-1.13``
+#: **不在 Go 的模型表里**。免费模型仅在 OpenCode 客户端内可用，
+#: 付费的 1.13 走按量计费；两者都不是 Go 的范畴。
+OPENCODE_GO_MODELS: tuple[str, ...] = (
+    "jev-1.14",
+    "gemini-decision-1",
+    "gpt-6-luna-decision",
+)
+
+#: Go 计划的默认模型。选 ``jev-1.14`` 因为它是 Go 表里最便宜且最快的。
+DEFAULT_OC_GO_MODEL = "jev-1.14"
+
 #: 这些模型**不需要** ``x-opencode-session`` 头。
 #:
 #: 文档明确：「a note that these requests don't need ``x-opencode-session``」。
@@ -133,6 +149,50 @@ class JevError(Exception):
 # --------------------------------------------------------------------------- #
 # 配置
 # --------------------------------------------------------------------------- #
+
+
+#: 所有「已知默认值」。填成这些值一律视为**没有手动指定**。
+_OC_KNOWN_DEFAULTS = frozenset(
+    {
+        "https://opencode.ai/inference/systemone/v1",
+        "https://opencode.ai/inference/go/systemone/v1",
+        "https://opencode.ai/inference/systemone/v1/systemone",
+        "https://opencode.ai/inference/go/systemone/v1/systemone",
+        "https://opencode.ai/inference",
+        "https://opencode.ai/inference/go",
+    }
+)
+
+
+def _resolve_oc_model(model: str, plan: str) -> str:
+    """Go 计划下 ``jev-1.13-free`` / ``jev-1.13`` 用不了，自动换成 Go 可用的。
+
+    实测：用户在 Go 下留着默认的 ``jev-1.13-free``，请求会走到
+    按量计费通道并报 402 余额不足 —— 因为这两个模型根本不在 Go 的
+    模型表里（官方 Go 页面只列 jev-1.14 / gemini-decision-1 /
+    gpt-6-luna-decision）。
+    """
+    if plan == "go" and model not in OPENCODE_GO_MODELS:
+        return DEFAULT_OC_GO_MODEL
+    return model
+
+
+def _resolve_oc_base(raw: str, plan: str) -> str:
+    """决定 OpenCode 的 base URL。
+
+    为什么要这么绕：面板里「API 地址」有默认值，**一旦配置被保存，那个
+    默认值就会变成用户配置里的实际值**。如果简单地「填了就用手填的」，
+    套餐选择就永远失效了 —— 实测踩过：
+
+        用户选 oc_plan=go，但 oc_api_base 是保存下来的 Console 默认值
+        → 请求打到 Console → 402「This request is pay-as-you-go」
+
+    所以：**只有值不在已知默认值集合里，才认为用户真的手动改过**。
+    """
+    base = (raw or "").strip().rstrip("/")
+    if base and base not in _OC_KNOWN_DEFAULTS:
+        return base  # 用户真的填了自定义地址（代理 / 私有部署）
+    return DEFAULT_OC_GO_BASE if plan == "go" else DEFAULT_OC_BASE
 
 
 @dataclass(frozen=True)
@@ -207,18 +267,17 @@ class JevConfig:
             cf_api_token=text("cf_api_token", ""),
             cf_model=cf_model,
             oc_api_key=text("oc_api_key", ""),
-            oc_api_base=(
-                text("oc_api_base", "").strip()
-                or (
-                    DEFAULT_OC_GO_BASE
-                    if text("oc_plan", "console").lower() == "go"
-                    else DEFAULT_OC_BASE
-                )
-            ),
             oc_plan=(
                 "go" if text("oc_plan", "console").lower() == "go" else "console"
             ),
-            oc_model=text("oc_model", DEFAULT_OC_MODEL) or DEFAULT_OC_MODEL,
+            oc_api_base=_resolve_oc_base(
+                text("oc_api_base", "").strip(),
+                "go" if text("oc_plan", "console").lower() == "go" else "console",
+            ),
+            oc_model=_resolve_oc_model(
+                text("oc_model", DEFAULT_OC_MODEL) or DEFAULT_OC_MODEL,
+                "go" if text("oc_plan", "console").lower() == "go" else "console",
+            ),
             cc_api_key=text("cc_api_key", ""),
             cc_api_base=text("cc_api_base", DEFAULT_CC_BASE) or DEFAULT_CC_BASE,
             cc_model=text("cc_model", DEFAULT_CC_MODEL) or DEFAULT_CC_MODEL,
@@ -750,12 +809,27 @@ def _explain_http_error(*, status: int, body: str, channel: str) -> str:
                 "请求必须带 x-opencode-session 头；本插件已自动附加，"
                 f"若仍出现说明请求链路被改写了。原始响应: {summary}"
             )
-        # 402：账户余额不足（付费模型）。
-        if status == 402 or "Insufficient account funds" in body:
+        # 402：余额不足。**Go 用户遇到这个几乎都是套餐选错了**。
+        if (
+            status == 402
+            or "Insufficient account funds" in body
+            or "Insufficient balance" in body
+        ):
+            if "pay-as-you-go" in body or "OpenCode Go covers only" in body:
+                return (
+                    f"OpenCode 报余额不足（HTTP {status}），"
+                    "但服务端说这次请求被当成**按量付费**处理了。"
+                    "这说明请求打到了 Console 端点、而不是 Go 端点。"
+                    "请把面板里的「OpenCode 套餐」选成 `Go 订阅`；"
+                    "并清空「OpenCode API 地址」（留空即自动跟随套餐）。"
+                    f"原始响应: {summary}"
+                )
             return (
                 f"OpenCode 账户余额不足（HTTP {status}）。"
-                "付费模型 jev-1.13 需要账户有余额；"
-                "若想免费使用，把模型改成 jev-1.13-free。"
+                "付费模型（如 jev-1.13 / jev-1.14）需要账户有余额。"
+                "三个可选方向：改用 Go 订阅（面板选「Go 订阅」）、"
+                "改用 jev-1.13-free（仅 Console，有隐藏上限）、"
+                "或换「TypeSafe 官方」渠道。"
                 f"原始响应: {summary}"
             )
         # 429：免费额度用尽（限时免费模型有未公开的用量上限）。

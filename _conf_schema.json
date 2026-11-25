@@ -350,8 +350,8 @@
       "oc_api_base": {
         "type": "string",
         "description": "OpenCode API 地址",
-        "hint": "一般无需修改。默认 https://opencode.ai/inference/systemone/v1，插件会自动补 /systemone。",
-        "default": "https://opencode.ai/inference/systemone/v1"
+        "hint": "**留空即可**，插件会按「OpenCode 套餐」自动选择：按量付费用 opencode.ai/inference，Go 订阅用 opencode.ai/inference/go。只有需要指向代理或私有部署时才填这里。注意：把它填成任何一种官方默认地址，都等于没填（会被自动纠正）。",
+        "default": ""
       },
       "oc_model": {
         "type": "string",
@@ -378,7 +378,7 @@
           "单次最多 400 问题，只支持文本和图片，有缓存降价"
         ],
         "default": "jev-1.13-free",
-        "hint": "OpenCode Go 的三个决策模型（Jev / Gemini Decision / GPT Luna Decision）共用同一个 endpoint、同样的请求体，只有 model 值不同，所以在这里切换即可。Gemini Decision 1 和 GPT 6 Luna Decision 不需要 x-opencode-session 头，但插件统一带上（Jev 必须带），不影响使用。"
+        "hint": "OpenCode 的决策模型（Jev / Gemini Decision / GPT Luna Decision）共用同一个 endpoint、同样的请求体，只有 model 值不同，所以在这里切换即可。**Go 订阅只能用 jev-1.14 / gemini-decision-1 / gpt-6-luna-decision** —— jev-1.13-free 和 jev-1.13 不在 Go 的模型表里，选了会自动换成 jev-1.14。"
       },
       "cc_api_key": {
         "type": "string",
